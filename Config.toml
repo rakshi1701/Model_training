@@ -1,0 +1,6 @@
+[server]
+# Raise this if you use browser upload for datasets larger than 200MB.
+# Value is in MB. 1024 = 1GB. Very large values can hit browser/network timeouts,
+# so for datasets in the 500MB-1GB+ range, prefer the "Local path" dataset mode
+# in the app instead of browser upload.
+maxUploadSize = 2048
