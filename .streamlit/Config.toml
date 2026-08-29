@@ -1,0 +1,5 @@
+[server]
+# Running on localhost only, so there's no real reason to cap this.
+# Value is in MB. 51200 = 50GB — raise further if you ever need to.
+maxUploadSize = 51200
+maxMessageSize = 51200
