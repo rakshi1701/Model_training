@@ -8,6 +8,11 @@ import streamlit as st
 import subprocess
 import zipfile
 import shutil
+import re
+import os
+import signal
+import threading
+import time
 import yaml
 from pathlib import Path
 
@@ -239,12 +244,39 @@ with col2:
 with col1:
     st.subheader("Training Console")
     log_placeholder = st.empty()
+    status_placeholder = st.empty()
 
-    start_disabled = data_yaml_path is None
-    if start_disabled:
+    # Session state persists across reruns within a browser session, which is
+    # what lets a background training process survive Streamlit's normal
+    # script-reruns-on-every-interaction model.
+    st.session_state.setdefault("proc", None)
+    st.session_state.setdefault("log_lines", [])
+    st.session_state.setdefault("training_active", False)
+    st.session_state.setdefault("paused", False)
+    st.session_state.setdefault("run_name_active", None)
+
+    def _reader_thread(proc, buf, progress_re):
+        for line in proc.stdout:
+            if progress_re.search(line) and "100%|" not in line:
+                continue  # skip intra-epoch progress-bar spam (see note above)
+            buf.append(line)
+        proc.stdout.close()
+
+    start_disabled = data_yaml_path is None or st.session_state.training_active
+    if data_yaml_path is None:
         st.caption("Upload and extract a dataset with a data.yaml to enable training.")
 
-    if st.button("Start Training", type="primary", disabled=start_disabled):
+    btn_cols = st.columns(4)
+    start_clicked = btn_cols[0].button("Start Training", type="primary", disabled=start_disabled)
+    pause_clicked = btn_cols[1].button(
+        "Pause", disabled=not st.session_state.training_active or st.session_state.paused
+    )
+    resume_clicked = btn_cols[2].button(
+        "Resume", disabled=not st.session_state.training_active or not st.session_state.paused
+    )
+    stop_clicked = btn_cols[3].button("Terminate", disabled=not st.session_state.training_active)
+
+    if start_clicked:
         cmd = [
             "yolo", "train",
             f"model={model_name}",
@@ -265,25 +297,80 @@ with col1:
             f"project={RUNS_DIR}",
             f"name={run_name}",
         ]
-        st.code(" ".join(cmd), language="bash")
+        st.session_state.log_lines = []
+        popen_kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        if os.name != "nt":
+            # New process group so Pause/Resume/Terminate reach dataloader
+            # worker subprocesses too, not just the main yolo process.
+            popen_kwargs["preexec_fn"] = os.setsid
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        progress_re = re.compile(r"\d+%\|")
+        threading.Thread(
+            target=_reader_thread, args=(proc, st.session_state.log_lines, progress_re), daemon=True
+        ).start()
+        st.session_state.proc = proc
+        st.session_state.training_active = True
+        st.session_state.paused = False
+        st.session_state.run_name_active = run_name
+        st.rerun()
 
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-        )
-        log_lines = []
-        for line in process.stdout:
-            log_lines.append(line)
-            log_placeholder.code("".join(log_lines[-50:]), language="bash")
-        process.wait()
+    def _signal_group(proc, sig):
+        if os.name == "nt":
+            return False
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+            return True
+        except Exception as e:
+            st.error(f"Signal failed: {e}")
+            return False
 
-        if process.returncode == 0:
+    if pause_clicked and st.session_state.proc:
+        if _signal_group(st.session_state.proc, signal.SIGSTOP):
+            st.session_state.paused = True
+        st.rerun()
+
+    if resume_clicked and st.session_state.proc:
+        if _signal_group(st.session_state.proc, signal.SIGCONT):
+            st.session_state.paused = False
+        st.rerun()
+
+    if stop_clicked and st.session_state.proc:
+        if st.session_state.paused:
+            _signal_group(st.session_state.proc, signal.SIGCONT)  # must resume before it can exit
+        if os.name == "nt":
+            st.session_state.proc.terminate()
+        else:
+            _signal_group(st.session_state.proc, signal.SIGTERM)
+        st.session_state.training_active = False
+        st.session_state.paused = False
+        st.rerun()
+
+    log_placeholder.code("".join(st.session_state.log_lines[-40:]), language="bash")
+
+    if st.session_state.training_active:
+        proc = st.session_state.proc
+        if proc.poll() is not None:
+            # Process ended on its own (completed, crashed, or was killed
+            # outside pause/resume) between reruns.
+            st.session_state.training_active = False
+            st.rerun()
+        else:
+            status_placeholder.caption("⏸ Paused" if st.session_state.paused else "🟢 Training…")
+            time.sleep(1)
+            st.rerun()
+    elif st.session_state.proc is not None:
+        returncode = st.session_state.proc.poll()
+        run_name_done = st.session_state.run_name_active
+        if returncode == 0:
             st.success("Training complete.")
-            best_pt = RUNS_DIR / run_name / "weights" / "best.pt"
+            best_pt = RUNS_DIR / run_name_done / "weights" / "best.pt"
             if best_pt.exists():
                 with open(best_pt, "rb") as f:
                     st.download_button("Download best.pt", f, file_name="best.pt")
-            results_png = RUNS_DIR / run_name / "results.png"
+            results_png = RUNS_DIR / run_name_done / "results.png"
             if results_png.exists():
                 st.image(str(results_png), caption="Training curves")
+        elif returncode is None:
+            st.warning("Training terminated.")
         else:
-            st.error("Training failed — check the console output above.")
+            st.error(f"Training exited with an error (code {returncode}). Check the console above.")
