@@ -3,3 +3,6 @@ training
 yolo_workspace
 *.zip
 dataset downloader.ipynb
+__pycache__/
+*.pyc
+
