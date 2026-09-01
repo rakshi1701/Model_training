@@ -22,6 +22,7 @@ from pathlib import Path
 import pandas as pd
 from PIL import Image
 import cv2
+import psutil
 
 try:
     import torch
@@ -354,6 +355,94 @@ def load_run_results(run_name: str):
 @st.cache_resource(max_entries=3)
 def load_yolo_cached(model_path: str):
     return YOLO(model_path)
+
+
+def get_system_utilization():
+    """Collects live system utilization stats (CPU, RAM, Disk, GPU)."""
+    stats = {}
+
+    # CPU
+    stats["cpu_percent"] = psutil.cpu_percent(interval=0)
+    stats["cpu_per_core"] = psutil.cpu_percent(interval=0, percpu=True)
+    stats["cpu_count_logical"] = psutil.cpu_count(logical=True)
+    stats["cpu_count_physical"] = psutil.cpu_count(logical=False)
+    try:
+        stats["cpu_freq"] = psutil.cpu_freq().current  # MHz
+    except Exception:
+        stats["cpu_freq"] = None
+
+    # Memory
+    mem = psutil.virtual_memory()
+    stats["ram_total_gb"] = mem.total / (1024 ** 3)
+    stats["ram_used_gb"] = mem.used / (1024 ** 3)
+    stats["ram_available_gb"] = mem.available / (1024 ** 3)
+    stats["ram_percent"] = mem.percent
+
+    # Swap
+    swap = psutil.swap_memory()
+    stats["swap_total_gb"] = swap.total / (1024 ** 3)
+    stats["swap_used_gb"] = swap.used / (1024 ** 3)
+    stats["swap_percent"] = swap.percent
+
+    # Disk
+    disk = psutil.disk_usage("/")
+    stats["disk_total_gb"] = disk.total / (1024 ** 3)
+    stats["disk_used_gb"] = disk.used / (1024 ** 3)
+    stats["disk_percent"] = disk.percent
+
+    # GPU via nvidia-smi (if available)
+    stats["gpus"] = []
+    try:
+        smi_out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit",
+             "--format=csv,noheader,nounits"],
+            text=True, timeout=3
+        ).strip()
+        for line in smi_out.split("\n"):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 6:
+                gpu = {
+                    "index": int(parts[0]),
+                    "name": parts[1],
+                    "util_percent": float(parts[2]) if parts[2] not in ("[N/A]", "") else None,
+                    "mem_used_mb": float(parts[3]) if parts[3] not in ("[N/A]", "") else None,
+                    "mem_total_mb": float(parts[4]) if parts[4] not in ("[N/A]", "") else None,
+                    "temp_c": float(parts[5]) if parts[5] not in ("[N/A]", "") else None,
+                    "power_w": float(parts[6]) if len(parts) > 6 and parts[6] not in ("[N/A]", "") else None,
+                    "power_limit_w": float(parts[7]) if len(parts) > 7 and parts[7] not in ("[N/A]", "") else None,
+                }
+                if gpu["mem_total_mb"] and gpu["mem_used_mb"]:
+                    gpu["mem_percent"] = (gpu["mem_used_mb"] / gpu["mem_total_mb"]) * 100
+                else:
+                    gpu["mem_percent"] = None
+                stats["gpus"].append(gpu)
+    except Exception:
+        pass
+
+    # Process-specific stats for the training subprocess
+    stats["train_proc"] = None
+    if st.session_state.train_proc and st.session_state.train_active:
+        try:
+            proc = psutil.Process(st.session_state.train_proc.pid)
+            children = proc.children(recursive=True)
+            total_rss = proc.memory_info().rss
+            total_cpu = proc.cpu_percent(interval=0)
+            for child in children:
+                try:
+                    total_rss += child.memory_info().rss
+                    total_cpu += child.cpu_percent(interval=0)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            stats["train_proc"] = {
+                "pid": proc.pid,
+                "rss_gb": total_rss / (1024 ** 3),
+                "cpu_percent": total_cpu,
+                "num_threads": proc.num_threads() + sum(c.num_threads() for c in children if c.is_running()),
+            }
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -781,6 +870,178 @@ with tab_train:
                 st.image(str(res_png), caption="Training Results Plot", width="stretch")
         else:
             st.caption("Training checkpoints and summary plots will appear here.")
+
+    # -------------------------------------------------------------------
+    # 📊 System Utilization Monitor (auto-refreshes every 2 seconds)
+    # -------------------------------------------------------------------
+    st.markdown("---")
+
+    @st.fragment(run_every=2)
+    def _system_utilization_monitor():
+        st.markdown("##### 📊 System Utilization Monitor — 🔴 Live")
+
+        sys_stats = get_system_utilization()
+
+        # ---- Row 1: CPU, RAM, Swap, Disk overview metrics ----
+        hw_k1, hw_k2, hw_k3, hw_k4 = st.columns(4)
+        cpu_freq_str = f" @ {sys_stats['cpu_freq']:.0f} MHz" if sys_stats.get('cpu_freq') else ""
+        hw_k1.metric(
+            f"CPU ({sys_stats['cpu_count_physical']}P/{sys_stats['cpu_count_logical']}L{cpu_freq_str})",
+            f"{sys_stats['cpu_percent']:.1f}%"
+        )
+        hw_k2.metric(
+            "RAM Usage",
+            f"{sys_stats['ram_used_gb']:.1f} / {sys_stats['ram_total_gb']:.1f} GB",
+            delta=f"{sys_stats['ram_percent']:.1f}% used",
+            delta_color="inverse" if sys_stats['ram_percent'] > 85 else "off"
+        )
+        hw_k3.metric(
+            "Swap",
+            f"{sys_stats['swap_used_gb']:.1f} / {sys_stats['swap_total_gb']:.1f} GB",
+            delta=f"{sys_stats['swap_percent']:.1f}% used" if sys_stats['swap_total_gb'] > 0 else "N/A",
+            delta_color="inverse" if sys_stats['swap_percent'] > 50 else "off"
+        )
+        hw_k4.metric(
+            "Disk (/)",
+            f"{sys_stats['disk_used_gb']:.0f} / {sys_stats['disk_total_gb']:.0f} GB",
+            delta=f"{sys_stats['disk_percent']:.1f}% used",
+            delta_color="inverse" if sys_stats['disk_percent'] > 90 else "off"
+        )
+
+        # ---- Row 2: CPU per-core utilization bar + RAM visual bar ----
+        util_col1, util_col2 = st.columns(2)
+
+        with util_col1:
+            cores = sys_stats["cpu_per_core"]
+            core_html_rows = ""
+            for i, pct in enumerate(cores):
+                if pct < 50:
+                    bar_color = f"rgb({int(pct * 5.1)}, 229, 163)"
+                elif pct < 80:
+                    bar_color = f"rgb(245, {int(229 - (pct - 50) * 5.7)}, {int(163 - (pct - 50) * 5.4)})"
+                else:
+                    bar_color = f"rgb(239, {max(68, int(163 - (pct - 80) * 4.75))}, {max(68, int(100 - (pct - 80) * 1.6))})"
+                core_html_rows += (
+                    f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;">'
+                    f'<span style="min-width:42px;font-size:0.72rem;color:#94a3b8;font-family:monospace;">C{i:02d}</span>'
+                    f'<div style="flex:1;height:14px;background:rgba(255,255,255,0.06);border-radius:4px;overflow:hidden;">'
+                    f'<div style="width:{pct}%;height:100%;background:{bar_color};border-radius:4px;transition:width 0.3s ease;"></div></div>'
+                    f'<span style="min-width:38px;text-align:right;font-size:0.72rem;color:#cbd5e1;font-family:monospace;">{pct:.0f}%</span>'
+                    f'</div>'
+                )
+            cpu_html = (
+                '<div style="background:rgba(15,23,42,0.6);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:12px 14px;max-height:260px;overflow-y:auto;">'
+                '<div style="font-weight:700;font-size:0.8rem;color:#38bdf8;margin-bottom:8px;">🧠 CPU Core Utilization</div>'
+                f'{core_html_rows}'
+                '</div>'
+            )
+            st.markdown(cpu_html, unsafe_allow_html=True)
+
+        with util_col2:
+            ram_pct = sys_stats["ram_percent"]
+            if ram_pct < 60:
+                ram_color, ram_glow = "#00e5a3", "rgba(0,229,163,0.3)"
+            elif ram_pct < 85:
+                ram_color, ram_glow = "#f59e0b", "rgba(245,158,11,0.3)"
+            else:
+                ram_color, ram_glow = "#ef4444", "rgba(239,68,68,0.3)"
+
+            train_proc_html = ""
+            if sys_stats["train_proc"]:
+                tp = sys_stats["train_proc"]
+                proc_ram_pct = (tp['rss_gb'] / sys_stats['ram_total_gb']) * 100 if sys_stats['ram_total_gb'] > 0 else 0
+                train_proc_html = (
+                    '<div style="background:rgba(0,229,163,0.08);border:1px solid rgba(0,229,163,0.2);border-radius:8px;padding:10px;margin-top:10px;">'
+                    f'<div style="font-size:0.75rem;color:#00e5a3;font-weight:700;margin-bottom:6px;">🏋️ Training Process (PID {tp["pid"]})</div>'
+                    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:0.75rem;">'
+                    f'<div style="color:#94a3b8;">Resident Memory</div><div style="color:#cbd5e1;text-align:right;font-weight:600;">{tp["rss_gb"]:.2f} GB ({proc_ram_pct:.1f}%)</div>'
+                    f'<div style="color:#94a3b8;">CPU Usage</div><div style="color:#cbd5e1;text-align:right;font-weight:600;">{tp["cpu_percent"]:.1f}%</div>'
+                    f'<div style="color:#94a3b8;">Threads</div><div style="color:#cbd5e1;text-align:right;font-weight:600;">{tp["num_threads"]}</div>'
+                    '</div></div>'
+                )
+
+            ram_html = (
+                '<div style="background:rgba(15,23,42,0.6);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:14px;">'
+                '<div style="font-weight:700;font-size:0.8rem;color:#38bdf8;margin-bottom:10px;">💾 Memory Allocation</div>'
+                '<div style="margin-bottom:14px;">'
+                '<div style="display:flex;justify-content:space-between;font-size:0.78rem;color:#94a3b8;margin-bottom:4px;">'
+                f'<span>RAM</span><span style="color:{ram_color};font-weight:700;">{sys_stats["ram_used_gb"]:.1f} GB / {sys_stats["ram_total_gb"]:.1f} GB ({ram_pct:.1f}%)</span></div>'
+                f'<div style="height:22px;background:rgba(255,255,255,0.06);border-radius:6px;overflow:hidden;box-shadow:0 0 8px {ram_glow};">'
+                f'<div style="width:{ram_pct}%;height:100%;background:linear-gradient(90deg,{ram_color}cc,{ram_color});border-radius:6px;transition:width 0.4s ease;"></div></div></div>'
+                '<div style="margin-bottom:14px;">'
+                '<div style="display:flex;justify-content:space-between;font-size:0.78rem;color:#94a3b8;margin-bottom:4px;">'
+                f'<span>Available</span><span style="color:#10b981;font-weight:600;">{sys_stats["ram_available_gb"]:.1f} GB free</span></div></div>'
+                f'{train_proc_html}'
+                '</div>'
+            )
+            st.markdown(ram_html, unsafe_allow_html=True)
+
+        # ---- Row 3: GPU Cards (if NVIDIA GPUs detected) ----
+        if sys_stats["gpus"]:
+            gpu_cols = st.columns(len(sys_stats["gpus"]))
+            for idx, gpu in enumerate(sys_stats["gpus"]):
+                with gpu_cols[idx]:
+                    gpu_util = gpu.get("util_percent", 0) or 0
+                    gpu_mem_pct = gpu.get("mem_percent", 0) or 0
+                    gpu_temp = gpu.get("temp_c")
+                    gpu_power = gpu.get("power_w")
+                    gpu_power_limit = gpu.get("power_limit_w")
+                    gpu_mem_used = gpu.get("mem_used_mb", 0) or 0
+                    gpu_mem_total = gpu.get("mem_total_mb", 0) or 0
+
+                    if gpu_temp and gpu_temp > 80:
+                        temp_color = "#ef4444"
+                    elif gpu_temp and gpu_temp > 65:
+                        temp_color = "#f59e0b"
+                    else:
+                        temp_color = "#10b981"
+
+                    if gpu_util > 80:
+                        util_color = "#00e5a3"
+                    elif gpu_util > 40:
+                        util_color = "#38bdf8"
+                    else:
+                        util_color = "#94a3b8"
+
+                    if gpu_mem_pct > 85:
+                        vram_color = "#ef4444"
+                    elif gpu_mem_pct > 60:
+                        vram_color = "#f59e0b"
+                    else:
+                        vram_color = "#00e5a3"
+
+                    power_html = ""
+                    if gpu_power and gpu_power_limit:
+                        power_html = (
+                            f'<div style="display:flex;justify-content:space-between;margin-top:6px;">'
+                            f'<span style="color:#94a3b8;">⚡ Power</span>'
+                            f'<span style="color:#cbd5e1;font-weight:600;">{gpu_power:.0f}W / {gpu_power_limit:.0f}W</span></div>'
+                        )
+
+                    temp_str = f'{gpu_temp:.0f}°C' if gpu_temp else 'N/A'
+
+                    gpu_html = (
+                        '<div style="background:rgba(15,23,42,0.7);border:1px solid rgba(56,189,248,0.2);border-radius:10px;padding:14px;">'
+                        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+                        f'<span style="font-weight:700;font-size:0.85rem;color:#38bdf8;">🎮 GPU {gpu["index"]}</span>'
+                        f'<span style="font-size:0.72rem;color:#94a3b8;background:rgba(255,255,255,0.06);padding:2px 8px;border-radius:12px;">{gpu["name"]}</span></div>'
+                        '<div style="font-size:0.78rem;">'
+                        '<div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+                        f'<span style="color:#94a3b8;">GPU Compute</span><span style="color:{util_color};font-weight:700;">{gpu_util:.0f}%</span></div>'
+                        f'<div style="height:16px;background:rgba(255,255,255,0.06);border-radius:5px;overflow:hidden;margin-bottom:10px;">'
+                        f'<div style="width:{gpu_util}%;height:100%;background:linear-gradient(90deg,{util_color}aa,{util_color});border-radius:5px;"></div></div>'
+                        '<div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+                        f'<span style="color:#94a3b8;">VRAM</span><span style="color:{vram_color};font-weight:700;">{gpu_mem_used:.0f} / {gpu_mem_total:.0f} MB ({gpu_mem_pct:.1f}%)</span></div>'
+                        f'<div style="height:16px;background:rgba(255,255,255,0.06);border-radius:5px;overflow:hidden;margin-bottom:8px;">'
+                        f'<div style="width:{gpu_mem_pct}%;height:100%;background:linear-gradient(90deg,{vram_color}aa,{vram_color});border-radius:5px;"></div></div>'
+                        f'<div style="display:flex;justify-content:space-between;">'
+                        f'<span style="color:#94a3b8;">🌡️ Temperature</span><span style="color:{temp_color};font-weight:700;">{temp_str}</span></div>'
+                        f'{power_html}'
+                        '</div></div>'
+                    )
+                    st.markdown(gpu_html, unsafe_allow_html=True)
+
+    _system_utilization_monitor()
 
     # Polling loop
     if st.session_state.train_active:
