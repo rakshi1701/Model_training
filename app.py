@@ -3,6 +3,8 @@ YOLO Studio v2.5: Training, Evaluation, Inference & Deployment Hub
 Run with: streamlit run app.py
 Requires: pip install streamlit ultralytics pyyaml pandas Pillow opencv-python-headless onnx onnxruntime
 """
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 import streamlit as st
 import subprocess
@@ -423,7 +425,7 @@ selected_ds_source = st.sidebar.selectbox("Dataset Source", dataset_options, ind
 data_yaml_path = None
 if selected_ds_source == "➕ Upload New Dataset (.zip)":
     uploaded_zip = st.sidebar.file_uploader("Upload .zip (up to 50GB)", type=["zip"])
-    if uploaded_zip and st.sidebar.button("📦 Extract & Activate", use_container_width=True):
+    if uploaded_zip and st.sidebar.button("📦 Extract & Activate", width="stretch"):
         if DATASET_DIR.exists():
             shutil.rmtree(DATASET_DIR)
         DATASET_DIR.mkdir(parents=True, exist_ok=True)
@@ -533,7 +535,7 @@ with tab_train:
     with preset_col2:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
         if st.session_state.tuned_params:
-            if st.button("✨ Apply Optuna Tuned Hyperparameters", type="primary", use_container_width=True):
+            if st.button("✨ Apply Optuna Tuned Hyperparameters", type="primary", width="stretch"):
                 st.toast("Tuned hyperparameters loaded into training settings!", icon="🎯")
 
     # Expandable Hyperparameter Settings
@@ -604,7 +606,7 @@ with tab_train:
     start_disabled = data_yaml_path is None or st.session_state.train_active
 
     with btn_col1:
-        if st.button("🚀 Start Training Run", type="primary", disabled=start_disabled, use_container_width=True):
+        if st.button("🚀 Start Training Run", type="primary", disabled=start_disabled, width="stretch"):
             cmd = [
                 "yolo", "train",
                 f"model={model_name}",
@@ -642,19 +644,19 @@ with tab_train:
             st.rerun()
 
     with btn_col2:
-        if st.button("⏸ Pause", disabled=not st.session_state.train_active or st.session_state.train_paused, use_container_width=True):
+        if st.button("⏸ Pause", disabled=not st.session_state.train_active or st.session_state.train_paused, width="stretch"):
             if _signal_group(st.session_state.train_proc, signal.SIGSTOP):
                 st.session_state.train_paused = True
             st.rerun()
 
     with btn_col3:
-        if st.button("▶ Resume", disabled=not st.session_state.train_active or not st.session_state.train_paused, use_container_width=True):
+        if st.button("▶ Resume", disabled=not st.session_state.train_active or not st.session_state.train_paused, width="stretch"):
             if _signal_group(st.session_state.train_proc, signal.SIGCONT):
                 st.session_state.train_paused = False
             st.rerun()
 
     with btn_col4:
-        if st.button("🛑 Terminate", disabled=not st.session_state.train_active, use_container_width=True):
+        if st.button("🛑 Terminate", disabled=not st.session_state.train_active, width="stretch"):
             if st.session_state.train_paused:
                 _signal_group(st.session_state.train_proc, signal.SIGCONT)
             if os.name == "nt":
@@ -768,15 +770,15 @@ with tab_train:
             if b_pt.exists():
                 st.success(f"✨ `best.pt` ready ({b_pt.stat().st_size / (1024*1024):.1f} MB)")
                 with open(b_pt, "rb") as f:
-                    st.download_button("📥 Download best.pt Weights", f, file_name=f"{current_run}_best.pt", key="dl_best_w", use_container_width=True)
+                    st.download_button("📥 Download best.pt Weights", f, file_name=f"{current_run}_best.pt", key="dl_best_w", width="stretch")
 
             if l_pt.exists():
                 with open(l_pt, "rb") as f:
-                    st.download_button("📥 Download last.pt Weights", f, file_name=f"{current_run}_last.pt", key="dl_last_w", use_container_width=True)
+                    st.download_button("📥 Download last.pt Weights", f, file_name=f"{current_run}_last.pt", key="dl_last_w", width="stretch")
 
             res_png = actual_run_dir / "results.png"
             if res_png.exists():
-                st.image(str(res_png), caption="Training Results Plot", use_container_width=True)
+                st.image(str(res_png), caption="Training Results Plot", width="stretch")
         else:
             st.caption("Training checkpoints and summary plots will appear here.")
 
@@ -811,11 +813,11 @@ with tab_ds:
         with ds_col1:
             st.markdown("##### 📊 Dataset Statistics")
             split_df = pd.DataFrame([{"Split": k.capitalize(), "Image Count": v} for k, v in ds_info["counts"].items()])
-            st.dataframe(split_df, use_container_width=True, hide_index=True)
+            st.dataframe(split_df, width="stretch", hide_index=True)
 
             st.markdown("##### 🏷️ Defined Classes")
             class_df = pd.DataFrame([{"Class ID": k, "Class Name": v} for k, v in ds_info["classes"].items()])
-            st.dataframe(class_df, use_container_width=True, hide_index=True)
+            st.dataframe(class_df, width="stretch", hide_index=True)
 
             st.markdown("##### 📄 Config File")
             st.code(str(ds_info["yaml_path"]), language="bash")
@@ -843,7 +845,7 @@ with tab_ds:
                         st.image(
                             annotated_rgb,
                             caption=f"Image [{sel_img_idx+1}/{len(img_files)}]: {chosen_img_path.name} • Ground Truth Boxes: {n_boxes}",
-                            use_container_width=True
+                            width="stretch"
                         )
                     else:
                         st.error("Could not load image.")
@@ -929,8 +931,8 @@ with tab_infer:
                             res_rgb = cv2.cvtColor(res.plot(), cv2.COLOR_BGR2RGB)
 
                             c_orig, c_pred = st.columns(2)
-                            c_orig.image(p_img, caption=f"Original: {u_img.name}", use_container_width=True)
-                            c_pred.image(res_rgb, caption=f"Detections ({t_inf:.1f} ms)", use_container_width=True)
+                            c_orig.image(p_img, caption=f"Original: {u_img.name}", width="stretch")
+                            c_pred.image(res_rgb, caption=f"Detections ({t_inf:.1f} ms)", width="stretch")
 
                             # Table
                             dets = []
@@ -943,12 +945,12 @@ with tab_infer:
                                     dets.append({"Class": cn, "Confidence": f"{cf*100:.1f}%", "Coordinates [x1, y1, x2, y2]": str(xy)})
 
                             if dets:
-                                st.dataframe(pd.DataFrame(dets), use_container_width=True)
+                                st.dataframe(pd.DataFrame(dets), width="stretch")
 
                             out_save = TEMP_DIR / f"det_{u_img.name}"
                             Image.fromarray(res_rgb).save(out_save)
                             with open(out_save, "rb") as f:
-                                st.download_button(f"📥 Download {u_img.name} Result", f, file_name=f"detected_{u_img.name}", use_container_width=True)
+                                st.download_button(f"📥 Download {u_img.name} Result", f, file_name=f"detected_{u_img.name}", width="stretch")
 
                 elif mode == "📂 Validation Dataset Sample":
                     val_imgs = []
@@ -978,8 +980,8 @@ with tab_infer:
                             res_rgb = cv2.cvtColor(res.plot(), cv2.COLOR_BGR2RGB)
 
                             c_orig, c_pred = st.columns(2)
-                            c_orig.image(p_img, caption=f"Validation Image: {sel_v_img.name}", use_container_width=True)
-                            c_pred.image(res_rgb, caption=f"Detections ({t_inf:.1f} ms)", use_container_width=True)
+                            c_orig.image(p_img, caption=f"Validation Image: {sel_v_img.name}", width="stretch")
+                            c_pred.image(res_rgb, caption=f"Detections ({t_inf:.1f} ms)", width="stretch")
 
                 elif mode == "📷 Live Webcam":
                     cam_snap = st.camera_input("Capture Webcam Frame")
@@ -1000,7 +1002,7 @@ with tab_infer:
                         )[0]
                         t_inf = (time.time() - t0) * 1000
                         res_rgb = cv2.cvtColor(res.plot(), cv2.COLOR_BGR2RGB)
-                        st.image(res_rgb, caption=f"Live Detection ({t_inf:.1f} ms)", use_container_width=True)
+                        st.image(res_rgb, caption=f"Live Detection ({t_inf:.1f} ms)", width="stretch")
 
                 elif mode == "🎥 Video File":
                     up_vid = st.file_uploader("Upload Video (MP4, AVI, MOV)", type=["mp4", "avi", "mov"])
@@ -1009,7 +1011,7 @@ with tab_infer:
                         with open(v_path, "wb") as f:
                             f.write(up_vid.getbuffer())
 
-                        if st.button("▶ Run Video Inference", type="primary", use_container_width=True):
+                        if st.button("▶ Run Video Inference", type="primary", width="stretch"):
                             out_v_path = TEMP_DIR / f"annotated_{up_vid.name}.mp4"
                             cap = cv2.VideoCapture(str(v_path))
                             w_v = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1038,7 +1040,7 @@ with tab_infer:
                             pbar.empty()
                             st.success("✅ Video processing complete!")
                             with open(out_v_path, "rb") as f:
-                                st.download_button("📥 Download Annotated Video", f, file_name=f"annotated_{up_vid.name}", use_container_width=True)
+                                st.download_button("📥 Download Annotated Video", f, file_name=f"annotated_{up_vid.name}", width="stretch")
 
             except Exception as e:
                 st.error(f"Inference execution error: {e}")
@@ -1080,7 +1082,7 @@ with tab_export:
         st.markdown("##### 2. Export Pipeline & Verification")
         st.info(f"Target: **{exp_fmt.upper()}** • Checkpoint: `{Path(sel_exp_model).name}` • Size: `{exp_sz}px`")
 
-        if st.button("🚀 Compile & Export Model", type="primary", use_container_width=True):
+        if st.button("🚀 Compile & Export Model", type="primary", width="stretch"):
             if not sel_exp_model or not Path(sel_exp_model).exists():
                 st.error("Invalid model selected.")
             else:
@@ -1102,14 +1104,14 @@ with tab_export:
                             sz_mb = ep.stat().st_size / (1024 * 1024)
                             st.caption(f"📦 Binary Size: **{sz_mb:.2f} MB**")
                             with open(ep, "rb") as f:
-                                st.download_button(f"📥 Download {ep.name}", f, file_name=ep.name, use_container_width=True)
+                                st.download_button(f"📥 Download {ep.name}", f, file_name=ep.name, width="stretch")
                         elif ep.is_dir():
                             zip_dst = EXPORTS_DIR / f"{ep.name}.zip"
                             shutil.make_archive(str(zip_dst.with_suffix("")), "zip", str(ep))
                             sz_mb = zip_dst.stat().st_size / (1024 * 1024)
                             st.caption(f"📦 Packaged Zip Size: **{sz_mb:.2f} MB**")
                             with open(zip_dst, "rb") as f:
-                                st.download_button(f"📥 Download {zip_dst.name}", f, file_name=zip_dst.name, use_container_width=True)
+                                st.download_button(f"📥 Download {zip_dst.name}", f, file_name=zip_dst.name, width="stretch")
                     except Exception as e:
                         st.error(f"Export error: {e}")
 
@@ -1137,7 +1139,7 @@ with tab_tune:
         t_start_dis = data_yaml_path is None or st.session_state.tune_active
 
         with t_btn1:
-            if st.button("🚀 Start Tuning", type="primary", disabled=t_start_dis, use_container_width=True):
+            if st.button("🚀 Start Tuning", type="primary", disabled=t_start_dis, width="stretch"):
                 cmd = [
                     "yolo", "tune",
                     f"model={t_base}",
@@ -1164,7 +1166,7 @@ with tab_tune:
                 st.rerun()
 
         with t_btn2:
-            if st.button("🛑 Stop Tuning", disabled=not st.session_state.tune_active, use_container_width=True):
+            if st.button("🛑 Stop Tuning", disabled=not st.session_state.tune_active, width="stretch"):
                 if os.name == "nt":
                     st.session_state.tune_proc.terminate()
                 else:
@@ -1188,7 +1190,7 @@ with tab_tune:
                     b_hyp = yaml.safe_load(f)
                 st.success(f"🏆 **Optimal Hyperparameters Discovered** (`{best_yaml.parent.name}`)")
                 st.json(b_hyp)
-                if st.button("✨ Save & Apply to Training Settings", type="primary", use_container_width=True):
+                if st.button("✨ Save & Apply to Training Settings", type="primary", width="stretch"):
                     st.session_state.tuned_params = b_hyp
                     st.toast("✅ Tuned hyperparameters transferred to Training Dashboard!", icon="🎯")
             except Exception:
@@ -1231,7 +1233,7 @@ with tab_history:
                 "Weights Ready": "✅" if has_w else "❌",
             })
 
-        st.dataframe(pd.DataFrame(history_records), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(history_records), width="stretch", hide_index=True)
 
         st.markdown("---")
         st.markdown("##### 🔍 Multi-Run Curve Overlay")
