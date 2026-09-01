@@ -33,6 +33,7 @@ except Exception:
     GPU_COUNT = 0
 
 from ultralytics import YOLO
+import kaggle_bridge
 
 # ---------------------------------------------------------------------------
 # Page Configuration
@@ -482,6 +483,8 @@ st.session_state.setdefault("tune_run_name", "tune1")
 
 st.session_state.setdefault("active_dataset_path", None)
 st.session_state.setdefault("tuned_params", None)
+st.session_state.setdefault("kaggle_active_kernel", None)
+st.session_state.setdefault("kaggle_status_info", None)
 
 # ---------------------------------------------------------------------------
 # Sidebar: Dataset Selector & Hardware Status
@@ -598,8 +601,9 @@ st.markdown(f"""
 # ---------------------------------------------------------------------------
 # Main Tabs Navigation
 # ---------------------------------------------------------------------------
-tab_train, tab_ds, tab_infer, tab_export, tab_tune, tab_history = st.tabs([
-    "🏋️ Training & Real-Time Metrics",
+tab_train, tab_kaggle, tab_ds, tab_infer, tab_export, tab_tune, tab_history = st.tabs([
+    "🏋️ Local Training & Metrics",
+    "☁️ Kaggle Cloud GPU Training",
     "📂 Dataset Hub & Visual Inspector",
     "🧪 Inference & Testing Playground",
     "📦 Model Export Studio",
@@ -1057,6 +1061,241 @@ with tab_train:
         else:
             time.sleep(1)
             st.rerun()
+
+
+# ===========================================================================
+# TAB 1.5: ☁️ KAGGLE CLOUD GPU TRAINING
+# ===========================================================================
+with tab_kaggle:
+    st.markdown("### ☁️ Kaggle Cloud GPU Training Hub")
+    st.caption("Offload training to Kaggle's free compute cluster (Dual NVIDIA Tesla T4 32GB VRAM / P100) and synchronize models automatically.")
+
+    # 1. Authentication Status Card
+    is_auth, kaggle_user, auth_err = kaggle_bridge.is_authenticated()
+
+    auth_col1, auth_col2 = st.columns([2, 1])
+    with auth_col1:
+        if is_auth:
+            st.markdown(f"""
+            <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 10px; padding: 12px 18px; margin-bottom: 12px;">
+                <span style="font-weight: 700; color: #10b981; font-size: 1rem;">🟢 Kaggle API Connected:</span> 
+                <span style="color: #f8fafc; font-weight: 600;">@{kaggle_user}</span>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 10px; padding: 12px 18px; margin-bottom: 12px;">
+                <span style="font-weight: 700; color: #f59e0b; font-size: 1rem;">⚠️ Kaggle API Not Connected</span>
+                <div style="color: #cbd5e1; font-size: 0.85rem; margin-top: 4px;">Configure your API token below to enable 1-click cloud GPU training.</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with auth_col2:
+        with st.expander("🔑 Kaggle API Credentials Setup", expanded=not is_auth):
+            st.markdown("""
+            **Get your API token:**
+            1. Sign in to [Kaggle](https://www.kaggle.com).
+            2. Go to **Account Settings** -> **API** -> Click **Create New Token**.
+            3. Enter your username and API key below:
+            """)
+            k_user_input = st.text_input("Kaggle Username", value=kaggle_user or "", placeholder="e.g. johndoe")
+            k_key_input = st.text_input("Kaggle API Key", type="password", placeholder="e.g. 38d9c...")
+            if st.button("💾 Save Credentials & Connect", type="primary", use_container_width=True):
+                if k_user_input and k_key_input:
+                    ok, msg = kaggle_bridge.save_credentials(k_user_input, k_key_input)
+                    if ok:
+                        st.success(msg)
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                else:
+                    st.warning("Please provide both Username and API Key.")
+
+    # 2. Hardware Resource Cards
+    res1, res2, res3 = st.columns(3)
+    with res1:
+        st.metric("⚡ Remote GPU Cluster", "2x NVIDIA T4", "32GB Total VRAM (DDP)")
+    with res2:
+        st.metric("⏱️ Free Cloud Quota", "30 Hours / Week", "GPU Accelerated")
+    with res3:
+        st.metric("📦 Local Ingestion", "Auto-Sync", "best.pt & results.csv")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # 3. Training Job Dispatcher
+    st.markdown("#### 🚀 Configure Remote Training Job")
+    k_col1, k_col2 = st.columns(2)
+
+    with k_col1:
+        st.markdown("##### 1. Dataset & Identification")
+        datasets_map = discover_all_datasets()
+        if datasets_map:
+            k_selected_ds = st.selectbox("Select Dataset to Train On", list(datasets_map.keys()), key="k_ds_select")
+            k_ds_yaml_path = datasets_map[k_selected_ds]
+            k_ds_folder = k_ds_yaml_path.parent
+        else:
+            st.warning("No datasets detected in workspace. Upload or extract a dataset in Dataset Hub.")
+            k_ds_yaml_path = None
+            k_ds_folder = None
+
+        k_ds_title = st.text_input("Kaggle Dataset Title", value=k_ds_folder.name if k_ds_folder else "cctv-yolo-dataset", help="Remote dataset name on Kaggle")
+        k_job_title = st.text_input("Kaggle Kernel Job Title", value="yolo11-cloud-training", help="Remote kernel notebook name")
+        k_target_exp = st.text_input("Local Target Run Name", value="kaggle_exp1", help="Name of folder to save weights into yolo_workspace/runs/")
+
+    with k_col2:
+        st.markdown("##### 2. Remote Hyperparameters")
+        k_arch_col1, k_arch_col2 = st.columns(2)
+        with k_arch_col1:
+            k_family = st.selectbox("Model Architecture", ["YOLO11", "YOLOv8", "YOLOv9", "YOLOv10"], key="k_family")
+            k_size_map = {
+                "YOLO11": ["yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt"],
+                "YOLOv8": ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"],
+                "YOLOv9": ["yolov9t.pt", "yolov9s.pt", "yolov9m.pt", "yolov9c.pt", "yolov9e.pt"],
+                "YOLOv10": ["yolov10n.pt", "yolov10s.pt", "yolov10m.pt", "yolov10b.pt", "yolov10l.pt", "yolov10x.pt"],
+            }
+        with k_arch_col2:
+            k_model_weight = st.selectbox("Weights / Scale", k_size_map.get(k_family, ["yolo11n.pt"]), key="k_model_weight")
+
+        k_p_col1, k_p_col2 = st.columns(2)
+        with k_p_col1:
+            k_epochs = st.slider("Epochs", 1, 300, 100, step=5, key="k_epochs")
+            k_batch = st.select_slider("Batch Size (GPU)", options=[8, 16, 32, 64, 128], value=32, key="k_batch")
+            k_imgsz = st.select_slider("Image Size (imgsz)", options=[320, 416, 512, 640, 768, 1024, 1280], value=640, key="k_imgsz")
+        with k_p_col2:
+            k_opt = st.selectbox("Optimizer", ["AdamW", "SGD", "Adam", "auto"], key="k_opt")
+            k_lr0 = st.number_input("Initial Learning Rate (lr0)", value=0.005, format="%.4f", step=0.001, key="k_lr0")
+            k_patience = st.number_input("Early Stopping Patience", min_value=0, max_value=100, value=20, key="k_patience")
+
+        k_dual_gpu = st.checkbox("⚡ Leverage Dual-GPU Distributed Data Parallel (2x T4)", value=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Launch Button
+    can_launch = is_auth and (k_ds_folder is not None)
+    if st.button("🚀 Stage Dataset & Dispatch Training to Kaggle GPU", type="primary", disabled=not can_launch, use_container_width=True):
+        api = kaggle_bridge.get_kaggle_api()
+        with st.status("🚀 Processing Kaggle Remote Job...", expanded=True) as status_box:
+            status_box.write("📦 Packaging and verifying dataset for Kaggle...")
+            ds_ok, ds_msg, ds_ref = kaggle_bridge.package_and_upload_dataset(
+                dataset_path=k_ds_folder,
+                dataset_title=k_ds_title,
+                api=api,
+                progress_callback=lambda msg: status_box.write(f"  ➜ {msg}")
+            )
+            if not ds_ok:
+                status_box.update(label="❌ Dataset upload failed", state="error")
+                st.error(ds_msg)
+            else:
+                status_box.write(f"✅ {ds_msg}")
+                status_box.write("🛰️ Generating remote training script and pushing kernel to Kaggle GPU cluster...")
+                disp_ok, disp_msg, kernel_ref = kaggle_bridge.dispatch_kaggle_training(
+                    dataset_ref=ds_ref,
+                    kernel_title=k_job_title,
+                    model_name=k_model_weight,
+                    epochs=k_epochs,
+                    batch_size=k_batch,
+                    imgsz=k_imgsz,
+                    optimizer=k_opt,
+                    lr0=k_lr0,
+                    patience=k_patience,
+                    enable_dual_gpu=k_dual_gpu,
+                    api=api
+                )
+                if not disp_ok:
+                    status_box.update(label="❌ Kernel dispatch failed", state="error")
+                    st.error(disp_msg)
+                else:
+                    status_box.update(label="🎉 Job Dispatched to Kaggle GPU Successfully!", state="complete")
+                    st.success(disp_msg)
+                    st.session_state.kaggle_active_kernel = kernel_ref
+                    kaggle_bridge.save_job_to_history({
+                        "kernel_ref": kernel_ref,
+                        "dataset_ref": ds_ref,
+                        "model_name": k_model_weight,
+                        "epochs": k_epochs,
+                        "target_exp": k_target_exp,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    })
+
+    st.markdown("---")
+
+    # 4. Remote Job Monitor & Ingestion Center
+    st.markdown("#### 📡 Kaggle Remote Job Monitor & Artifact Ingestion")
+
+    recent_jobs = kaggle_bridge.list_recent_jobs_history()
+    job_options = [j["kernel_ref"] for j in recent_jobs] if recent_jobs else []
+    if st.session_state.kaggle_active_kernel and st.session_state.kaggle_active_kernel not in job_options:
+        job_options.insert(0, st.session_state.kaggle_active_kernel)
+
+    mon_col1, mon_col2 = st.columns([2, 1])
+
+    with mon_col1:
+        active_mon_kernel = st.selectbox(
+            "Select Remote Kernel to Monitor / Ingest",
+            job_options if job_options else ["No remote jobs recorded yet"],
+            index=0 if job_options else 0
+        )
+        refresh_status = st.button("🔄 Refresh Remote Status", use_container_width=True)
+
+    if active_mon_kernel and active_mon_kernel != "No remote jobs recorded yet":
+        k_info = kaggle_bridge.get_kernel_status(active_mon_kernel)
+        st.session_state.kaggle_status_info = k_info
+
+        k_stat = k_info.get("status", "unknown")
+        k_url = k_info.get("url", f"https://www.kaggle.com/code/{active_mon_kernel}")
+
+        with mon_col2:
+            st.markdown(f"**Web Link:** [🔗 Open in Kaggle Console]({k_url})")
+            if k_stat in ["running", "queued"]:
+                st.markdown(f'<span class="status-badge status-running">🟢 Status: {k_stat.upper()}</span>', unsafe_allow_html=True)
+            elif k_stat in ["complete"]:
+                st.markdown('<span class="status-badge status-idle" style="color: #10b981; border-color: #10b981;">🎉 Status: COMPLETE</span>', unsafe_allow_html=True)
+            elif k_stat in ["error"]:
+                st.markdown('<span class="status-badge status-paused" style="color: #ef4444; border-color: #ef4444;">❌ Status: ERROR</span>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<span class="status-badge status-idle">⚪ Status: {k_stat.upper()}</span>', unsafe_allow_html=True)
+
+        if k_stat == "error" and k_info.get("failureMessage"):
+            st.error(f"Kernel Failure: {k_info.get('failureMessage')}")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Artifact Ingestion Section
+        ingest_col1, ingest_col2 = st.columns([2, 1])
+        with ingest_col1:
+            dest_exp = st.text_input("Destination Folder in yolo_workspace/runs/", value=k_target_exp, key="dest_exp_input")
+        with ingest_col2:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            if st.button("📥 Ingest Checkpoints (best.pt & results.csv)", type="primary", use_container_width=True):
+                with st.spinner("Downloading output artifacts from Kaggle Cloud..."):
+                    dl_ok, dl_msg, downloaded_path = kaggle_bridge.download_and_ingest_artifacts(
+                        kernel_ref=active_mon_kernel,
+                        target_exp_name=dest_exp
+                    )
+                    if dl_ok:
+                        st.success(dl_msg)
+                        st.toast(f"Checkpoints ingested into {dest_exp}!", icon="🎯")
+                    else:
+                        st.error(dl_msg)
+
+    # 5. Standalone Notebook Template Expander
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("📓 Standalone Kaggle Notebook Template (.ipynb)"):
+        st.markdown("""
+        Prefer running manually in the Kaggle UI? Download the pre-built notebook template below, upload it directly to Kaggle, attach your dataset, and hit **Run All**.
+        """)
+        template_path = Path("kaggle_yolo_train_template.ipynb")
+        if template_path.exists():
+            with open(template_path, "r") as f:
+                nb_content = f.read()
+            st.download_button(
+                label="📥 Download kaggle_yolo_train_template.ipynb",
+                data=nb_content,
+                file_name="kaggle_yolo_train_template.ipynb",
+                mime="application/x-ipynb+json",
+                use_container_width=True
+            )
 
 
 # ===========================================================================

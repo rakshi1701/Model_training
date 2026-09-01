@@ -39,7 +39,13 @@ A comprehensive Streamlit workspace for managing the entire lifecycle of YOLO co
 - Live tuning console and real-time best parameters (`best_hyperparameters.yaml`) viewer.
 - **1-Click Apply**: Automatically transfer tuned parameters directly into the Training dashboard.
 
-### 5. 📊 Run History & Comparisons
+### 5. ☁️ Kaggle Cloud GPU Training Hub
+- **Free Multi-GPU Acceleration**: Offload long training jobs to Kaggle's Dual NVIDIA Tesla T4 (32GB VRAM) or P100 GPUs via PyTorch Distributed Data Parallel (DDP).
+- **1-Click Remote Dispatch**: Seamlessly packages datasets, pushes training kernels via Kaggle API, and tracks live execution status from within the dashboard.
+- **Automated Checkpoint Sync**: Automatically downloads `best.pt`, `results.csv`, and validation figures into `yolo_workspace/runs/` for immediate local inference and evaluation.
+- **Standalone Jupyter Template**: Includes a pre-configured `kaggle_yolo_train_template.ipynb` for direct web notebook training.
+
+### 6. 📊 Run History & Comparisons
 - Automatically tracks all training experiments in `yolo_workspace/runs/`.
 - Multi-run overlay comparison charts for mAP50, mAP50-95, and loss curves across experiments.
 - Download artifacts and view confusion matrices, PR curves, and validation batch predictions.
@@ -86,13 +92,15 @@ my_dataset.zip
 
 ```
 .
-├── app.py                  # Main Streamlit Vision Studio
-├── Requirements.txt        # Dependencies
+├── app.py                            # Main Streamlit Vision Studio
+├── kaggle_bridge.py                  # Kaggle Cloud API Integration & Sync Engine
+├── kaggle_yolo_train_template.ipynb  # Standalone Kaggle Notebook Template
+├── Requirements.txt                  # Dependencies
 ├── .streamlit/
-│   └── config.toml         # 50GB upload configuration
+│   └── config.toml                   # 50GB upload configuration
 └── yolo_workspace/
-    ├── dataset/            # Extracted active dataset
-    ├── runs/               # Training run outputs & checkpoints
-    ├── tune/               # Hyperparameter tuning experiments
-    └── exports/            # Exported deployment models (ONNX, TensorRT, etc.)
+    ├── dataset/                      # Extracted active dataset
+    ├── runs/                         # Training run outputs & checkpoints
+    ├── tune/                         # Hyperparameter tuning experiments
+    └── exports/                      # Exported deployment models (ONNX, TensorRT, etc.)
 ```

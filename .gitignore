@@ -5,4 +5,6 @@ yolo_workspace
 dataset downloader.ipynb
 __pycache__/
 *.pyc
-
+Kaggle_connect.md
+kaggle.json
+*.pt
