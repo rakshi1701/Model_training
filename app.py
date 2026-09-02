@@ -207,6 +207,21 @@ def load_presets():
 # ---------------------------------------------------------------------------
 # Helper Functions: Dataset, Visual Ground Truth & Metrics
 # ---------------------------------------------------------------------------
+def safe_rmtree(path: Path):
+    """Safely removes a directory tree without throwing Errno 39."""
+    if not path or not Path(path).exists():
+        return
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+    if Path(path).exists():
+        try:
+            subprocess.run(["rm", "-rf", str(path)], check=False)
+        except Exception:
+            pass
+
+
 def discover_all_datasets():
     """Finds all available datasets in workspace and dataset directory."""
     datasets = {}
@@ -519,7 +534,7 @@ if selected_ds_source == "➕ Upload New Dataset (.zip)":
     uploaded_zip = st.sidebar.file_uploader("Upload .zip (up to 50GB)", type=["zip"])
     if uploaded_zip and st.sidebar.button("📦 Extract & Activate", width="stretch"):
         if DATASET_DIR.exists():
-            shutil.rmtree(DATASET_DIR)
+            safe_rmtree(DATASET_DIR)
         DATASET_DIR.mkdir(parents=True, exist_ok=True)
         zip_path = DATASET_DIR / "upload.zip"
         with open(zip_path, "wb") as f:
@@ -1095,10 +1110,27 @@ with tab_kaggle:
             st.markdown("""
             **Get your API token:**
             1. Sign in to [Kaggle](https://www.kaggle.com).
-            2. Go to **Account Settings** -> **API** -> Click **Create New Token**.
-            3. Enter your username and API key below:
+            2. Go to **Account Settings** -> **API** -> Click **Create New Token** (`kaggle.json`).
             """)
-            k_user_input = st.text_input("Kaggle Username", value=kaggle_user or "", placeholder="e.g. johndoe")
+            uploaded_k_json = st.file_uploader("Upload kaggle.json", type=["json"], key="k_json_uploader")
+            if uploaded_k_json:
+                try:
+                    k_data = json.load(uploaded_k_json)
+                    u = k_data.get("username", "")
+                    k = k_data.get("key", "")
+                    if u and k:
+                        ok, msg = kaggle_bridge.save_credentials(u, k)
+                        if ok:
+                            st.success(msg)
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                except Exception as e:
+                    st.error(f"Invalid JSON file: {e}")
+
+            st.markdown("*Or enter manually:*")
+            k_user_input = st.text_input("Kaggle Username (handle, not email)", value=kaggle_user or "", placeholder="e.g. rakshithr1701")
             k_key_input = st.text_input("Kaggle API Key", type="password", placeholder="e.g. 38d9c...")
             if st.button("💾 Save Credentials & Connect", type="primary", use_container_width=True):
                 if k_user_input and k_key_input:

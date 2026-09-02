@@ -2,16 +2,18 @@
 Kaggle Bridge Module for YOLO Vision Studio
 Handles:
 - Authentication & Credentials Management (~/.kaggle/kaggle.json & ~/.config/kaggle/kaggle.json)
-- Dataset packaging and remote upload/versioning via Kaggle Dataset API
+- Dataset packaging and remote upload/versioning via Kaggle Dataset API (with dir_mode='zip' support)
 - Dynamic training script generation (PyTorch DDP, Dual T4 GPU support, Ultralytics YOLO)
 - Remote kernel dispatching and real-time status polling
 - Automatic artifact ingestion (best.pt, results.csv, confusion matrix) into yolo_workspace/runs/
 """
 
 import os
+import sys
 import json
 import shutil
 import zipfile
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -21,30 +23,123 @@ KAGGLE_DIR = Path.home() / ".kaggle"
 KAGGLE_CONFIG_DIR = Path.home() / ".config" / "kaggle"
 KAGGLE_JSON = KAGGLE_DIR / "kaggle.json"
 KAGGLE_CONFIG_JSON = KAGGLE_CONFIG_DIR / "kaggle.json"
+KAGGLE_ACCESS_TOKEN = KAGGLE_DIR / "access_token"
+KAGGLE_CONFIG_ACCESS_TOKEN = KAGGLE_CONFIG_DIR / "access_token"
 
 WORKSPACE_DIR = Path(__file__).parent / "yolo_workspace"
 RUNS_DIR = WORKSPACE_DIR / "runs"
 KAGGLE_STAGING_DIR = WORKSPACE_DIR / "temp" / "kaggle_staging"
 
 
+def safe_rmtree(path: Path):
+    """Safely removes a directory tree without throwing Errno 39."""
+    if not path or not Path(path).exists():
+        return
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+    if Path(path).exists():
+        try:
+            subprocess.run(["rm", "-rf", str(path)], check=False)
+        except Exception:
+            pass
+
+
+def sanitize_username(username: str) -> str:
+    """If username is an email (user@gmail.com), extracts the username handle portion."""
+    if not username:
+        return ""
+    username = username.strip()
+    if "@" in username:
+        username = username.split("@")[0]
+    return username
+
+
+def is_bearer_token(key: str) -> bool:
+    """New-style Kaggle API tokens are opaque strings prefixed with 'KGAT_'.
+
+    These only authenticate via 'Authorization: Bearer <token>', which the kaggle
+    client uses only when the KAGGLE_API_TOKEN env var is set. Legacy keys are a
+    bare 32-char hex string and use HTTP Basic auth (username + key).
+    """
+    return bool(key) and key.strip().lower().startswith("kgat_")
+
+
+def _apply_auth_env(username: str, key: str):
+    """Exports the right env vars so the kaggle client picks the correct auth mode.
+
+    kagglesdk.KaggleHttpClient checks KAGGLE_API_TOKEN first (Bearer), then falls
+    back to KAGGLE_USERNAME/KAGGLE_KEY (Basic). For KGAT_ tokens we must set
+    KAGGLE_API_TOKEN or every write call 401s on blobs/upload.
+    """
+    if username:
+        os.environ["KAGGLE_USERNAME"] = username
+    if key:
+        os.environ["KAGGLE_KEY"] = key
+    if is_bearer_token(key):
+        os.environ["KAGGLE_API_TOKEN"] = key.strip()
+    else:
+        os.environ.pop("KAGGLE_API_TOKEN", None)
+
+
+def _read_username_hint() -> str:
+    """Best-effort Kaggle handle from kaggle.json or env (not required for auth)."""
+    for p in [KAGGLE_JSON, KAGGLE_CONFIG_JSON]:
+        if p.exists():
+            try:
+                with open(p, "r") as f:
+                    u = sanitize_username(json.load(f).get("username", ""))
+                if u:
+                    return u
+            except Exception:
+                pass
+    return sanitize_username(os.environ.get("KAGGLE_USERNAME", ""))
+
+
 def _load_stored_credentials() -> Optional[Tuple[str, str]]:
-    """Reads username and key from ~/.kaggle/kaggle.json or ~/.config/kaggle/kaggle.json or env."""
+    """Reads (username, key) from env, the access_token file, or kaggle.json.
+
+    'key' may be a legacy hex key or a new-style 'KGAT_' bearer token. The
+    dedicated token mechanism (KAGGLE_API_TOKEN env / access_token file) is the
+    modern one and takes precedence over a possibly-stale kaggle.json 'key', so a
+    half-migrated setup still authenticates. The access_token file holds only the
+    token, so the username is sourced separately.
+    """
+    username_hint = _read_username_hint()
+
+    # 1. Explicit env override.
+    env_token = os.environ.get("KAGGLE_API_TOKEN", "").strip()
+    if env_token:
+        return username_hint, env_token
+
+    env_u = sanitize_username(os.environ.get("KAGGLE_USERNAME", ""))
+    env_k = os.environ.get("KAGGLE_KEY", "").strip()
+    if env_u and env_k:
+        return env_u, env_k
+
+    # 2. Dedicated token file.
+    for p in [KAGGLE_ACCESS_TOKEN, KAGGLE_CONFIG_ACCESS_TOKEN]:
+        if p.exists():
+            try:
+                tok = p.read_text().strip()
+                if tok:
+                    return username_hint, tok
+            except Exception:
+                pass
+
+    # 3. Legacy kaggle.json username + key.
     for p in [KAGGLE_JSON, KAGGLE_CONFIG_JSON]:
         if p.exists():
             try:
                 with open(p, "r") as f:
                     creds = json.load(f)
-                u = creds.get("username", "").strip()
+                u = sanitize_username(creds.get("username", ""))
                 k = creds.get("key", "").strip()
                 if u and k:
                     return u, k
             except Exception:
                 pass
-
-    env_u = os.environ.get("KAGGLE_USERNAME", "").strip()
-    env_k = os.environ.get("KAGGLE_KEY", "").strip()
-    if env_u and env_k:
-        return env_u, env_k
 
     return None
 
@@ -56,16 +151,33 @@ def get_kaggle_api():
         return None
 
     u, k = creds
-    os.environ["KAGGLE_USERNAME"] = u
-    os.environ["KAGGLE_KEY"] = k
+    _apply_auth_env(u, k)
 
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
         api = KaggleApi()
         api.authenticate()
         return api
-    except Exception as e:
+    except Exception:
         return None
+
+
+def _verify_api(api) -> Optional[str]:
+    """Makes one cheap authenticated call. Returns None if OK, else an error string.
+
+    api.authenticate() never contacts the server, so a revoked/expired token or a
+    wrong auth mode only surfaces on the first real request (e.g. a 401 on
+    blobs/upload during upload). This catches it up front.
+    """
+    try:
+        api.competitions_list(page=1)
+        return None
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "Unauthorized" in msg or "Unauthenticated" in msg:
+            return ("Kaggle rejected the token (401). Create a new token at "
+                    "kaggle.com/settings > API and re-enter it.")
+        return msg
 
 
 def is_authenticated() -> Tuple[bool, Optional[str], Optional[str]]:
@@ -80,10 +192,12 @@ def is_authenticated() -> Tuple[bool, Optional[str], Optional[str]]:
     username, key = creds
     try:
         api = get_kaggle_api()
-        if api is not None:
-            return True, username, None
-        else:
+        if api is None:
             return False, username, "Credentials present, but Kaggle API authentication failed."
+        err = _verify_api(api)
+        if err:
+            return False, username, err
+        return True, username, None
     except Exception as e:
         return False, username, str(e)
 
@@ -92,7 +206,7 @@ def save_credentials(username: str, key: str) -> Tuple[bool, str]:
     """
     Saves username and API key to ~/.kaggle/kaggle.json and ~/.config/kaggle/kaggle.json with 0600 permissions.
     """
-    username = username.strip()
+    username = sanitize_username(username)
     key = key.strip()
     if not username or not key:
         return False, "Username and API key cannot be empty."
@@ -114,15 +228,28 @@ def save_credentials(username: str, key: str) -> Tuple[bool, str]:
             json.dump(data, f, indent=2)
         os.chmod(KAGGLE_CONFIG_JSON, 0o600)
 
-        os.environ["KAGGLE_USERNAME"] = username
-        os.environ["KAGGLE_KEY"] = key
-
-        # Verify authentication
-        api = get_kaggle_api()
-        if api is not None:
-            return True, f"Successfully authenticated with Kaggle as @{username}!"
+        # New-style 'KGAT_' tokens are also written to the access_token file the
+        # kaggle client reads, and drive Bearer auth via KAGGLE_API_TOKEN.
+        if is_bearer_token(key):
+            for tok_path in [KAGGLE_ACCESS_TOKEN, KAGGLE_CONFIG_ACCESS_TOKEN]:
+                with open(tok_path, "w") as f:
+                    f.write(key)
+                os.chmod(tok_path, 0o600)
         else:
+            for tok_path in [KAGGLE_ACCESS_TOKEN, KAGGLE_CONFIG_ACCESS_TOKEN]:
+                if tok_path.exists():
+                    tok_path.unlink()
+
+        _apply_auth_env(username, key)
+
+        # Verify authentication with a real authenticated request.
+        api = get_kaggle_api()
+        if api is None:
             return False, "Credentials saved, but authentication failed. Please double check your API token."
+        err = _verify_api(api)
+        if err:
+            return False, f"Credentials saved, but Kaggle rejected them: {err}"
+        return True, f"Successfully authenticated with Kaggle as @{username}!"
     except Exception as e:
         return False, f"Failed to save credentials: {str(e)}"
 
@@ -143,7 +270,7 @@ def package_and_upload_dataset(
 ) -> Tuple[bool, str, Optional[str]]:
     """
     Validates a local YOLO dataset directory, creates dataset-metadata.json,
-    and uploads or versions it on Kaggle.
+    and uploads or versions it on Kaggle using dir_mode='zip' to preserve subfolders.
     Returns: (success, message, dataset_ref)
     """
     if api is None:
@@ -173,8 +300,7 @@ def package_and_upload_dataset(
     dataset_ref = f"{username}/{dataset_slug}"
 
     staging_dir = KAGGLE_STAGING_DIR / "dataset" / dataset_slug
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
+    safe_rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     if progress_callback:
@@ -200,7 +326,7 @@ def package_and_upload_dataset(
         json.dump(metadata, f, indent=2)
 
     if progress_callback:
-        progress_callback("Uploading dataset to Kaggle...")
+        progress_callback("Uploading dataset to Kaggle (zipping folders)...")
 
     try:
         existing_datasets = [str(d) for d in api.dataset_list(user=username)]
@@ -210,14 +336,16 @@ def package_and_upload_dataset(
             api.dataset_create_version(
                 folder=str(staging_dir),
                 version_notes=f"Updated from YOLO Studio at {time.strftime('%Y-%m-%d %H:%M:%S')}",
-                quiet=False
+                quiet=False,
+                dir_mode="zip"
             )
             return True, f"Dataset '{dataset_ref}' updated with new version.", dataset_ref
         else:
             api.dataset_create_new(
                 folder=str(staging_dir),
                 public=False,
-                quiet=False
+                quiet=False,
+                dir_mode="zip"
             )
             return True, f"Private dataset '{dataset_ref}' successfully created on Kaggle.", dataset_ref
     except Exception as e:
@@ -227,7 +355,8 @@ def package_and_upload_dataset(
                 api.dataset_create_version(
                     folder=str(staging_dir),
                     version_notes="Updated from YOLO Studio",
-                    quiet=False
+                    quiet=False,
+                    dir_mode="zip"
                 )
                 return True, f"Dataset '{dataset_ref}' updated with a new version.", dataset_ref
             except Exception as e2:
@@ -404,8 +533,7 @@ def dispatch_kaggle_training(
     kernel_ref = f"{username}/{kernel_slug}"
 
     staging_dir = KAGGLE_STAGING_DIR / "kernel" / kernel_slug
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
+    safe_rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Generate train_remote.py
@@ -440,9 +568,10 @@ def dispatch_kaggle_training(
     with open(staging_dir / "kernel-metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
-    # 3. Push kernel
+    # 3. Push kernel (kernels_push is the library call; kernels_push_cli is a
+    # thin CLI wrapper whose 'timeout' arg has no default in kaggle >=1.7).
     try:
-        api.kernels_push_cli(folder=str(staging_dir))
+        api.kernels_push(folder=str(staging_dir), timeout=None)
         return True, f"Training job successfully dispatched to Kaggle GPU cluster! (Kernel: {kernel_ref})", kernel_ref
     except Exception as e:
         return False, f"Failed to push kernel to Kaggle: {str(e)}", None
@@ -459,9 +588,17 @@ def get_kernel_status(kernel_ref: str, api=None) -> Dict[str, Any]:
             return {"status": "error", "message": "Kaggle API not authenticated."}
 
     try:
-        result = api.kernel_status(kernel_ref)
-        status = result.get("status", "unknown").lower()
-        failure_msg = result.get("failureMessage")
+        # kaggle >=1.7: method is kernels_status (plural) and returns an object
+        # with .status / .failure_message, not a dict.
+        result = api.kernels_status(kernel_ref)
+        if isinstance(result, dict):
+            raw_status = result.get("status", "unknown")
+            failure_msg = result.get("failureMessage") or result.get("failure_message")
+        else:
+            raw_status = getattr(result, "status", "unknown")
+            failure_msg = getattr(result, "failure_message", None)
+        # status may be an enum (e.g. KernelWorkerStatus.COMPLETE) or a string.
+        status = str(getattr(raw_status, "name", raw_status)).split(".")[-1].lower()
         kernel_url = f"https://www.kaggle.com/code/{kernel_ref}"
         return {
             "status": status,
@@ -469,9 +606,19 @@ def get_kernel_status(kernel_ref: str, api=None) -> Dict[str, Any]:
             "url": kernel_url
         }
     except Exception as e:
+        msg = str(e)
+        # kaggle 1.7.4.x's /kernels/status endpoint 404s for kernels without an
+        # active session (confirmed: the `kaggle kernels status` CLI 404s too).
+        # Don't surface that as a run failure — the job may still be fine.
+        if "404" in msg or "Not Found" in msg:
+            return {
+                "status": "unknown",
+                "message": "Status polling unavailable (Kaggle API). Open the web link to check progress, then use Ingest Checkpoints once it finishes.",
+                "url": f"https://www.kaggle.com/code/{kernel_ref}",
+            }
         return {
             "status": "error",
-            "message": str(e),
+            "message": msg,
             "url": f"https://www.kaggle.com/code/{kernel_ref}"
         }
 
@@ -495,8 +642,7 @@ def download_and_ingest_artifacts(
     target_run_dir.mkdir(parents=True, exist_ok=True)
 
     temp_download_dir = KAGGLE_STAGING_DIR / "downloads" / target_exp_name
-    if temp_download_dir.exists():
-        shutil.rmtree(temp_download_dir)
+    safe_rmtree(temp_download_dir)
     temp_download_dir.mkdir(parents=True, exist_ok=True)
 
     try:
