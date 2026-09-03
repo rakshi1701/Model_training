@@ -25,11 +25,8 @@ import cv2
 import psutil
 
 try:
-    import warnings
     import torch
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=UserWarning, message=".*CUDA initialization.*")
-        CUDA_AVAILABLE = torch.cuda.is_available()
+    CUDA_AVAILABLE = torch.cuda.is_available()
     GPU_COUNT = torch.cuda.device_count() if CUDA_AVAILABLE else 0
 except Exception:
     CUDA_AVAILABLE = False
@@ -365,8 +362,6 @@ def load_run_results(run_name: str):
         try:
             df = pd.read_csv(csv_path)
             df.columns = df.columns.str.strip()
-            if df.dropna(how="all").empty:      # header-only / all-NaN file
-                return None, actual_dir
             return df, actual_dir
         except Exception:
             return None, actual_dir
@@ -440,14 +435,11 @@ def get_system_utilization():
     except Exception:
         pass
 
-    # Process-specific stats for the training subprocess. Use .get() — this runs
-    # from an auto-refreshing fragment that can tick before the main script has
-    # initialised session_state.
+    # Process-specific stats for the training subprocess
     stats["train_proc"] = None
-    _tp = st.session_state.get("train_proc")
-    if _tp and st.session_state.get("train_active"):
+    if st.session_state.train_proc and st.session_state.train_active:
         try:
-            proc = psutil.Process(_tp.pid)
+            proc = psutil.Process(st.session_state.train_proc.pid)
             children = proc.children(recursive=True)
             total_rss = proc.memory_info().rss
             total_cpu = proc.cpu_percent(interval=0)
@@ -850,29 +842,23 @@ with tab_train:
         # Metric Curves Tabs
         chart_tab1, chart_tab2, chart_tab3 = st.tabs(["📉 Training & Validation Losses", "🎯 mAP & Accuracy Dynamics", "⚡ Learning Rate Schedule"])
 
-        def _plot(cols):
-            if not cols or df_results is None or df_results.empty:
-                st.caption("No numeric data yet.")
-                return
-            valid_cols = [c for c in cols if c in df_results.columns]
-            if not valid_cols:
-                st.caption("No numeric data yet.")
-                return
-            pdf = (df_results.set_index("epoch")[valid_cols]
-                   if "epoch" in df_results.columns else df_results[valid_cols])
-            pdf = pdf.apply(pd.to_numeric, errors="coerce").dropna(how="all")
-            if pdf.empty or len(pdf.dropna(how="all")) == 0:
-                st.caption("No numeric data yet.")
-            else:
+        with chart_tab1:
+            loss_cols = [c for c in df_results.columns if "loss" in c.lower()]
+            if loss_cols:
+                pdf = df_results.set_index("epoch")[loss_cols] if "epoch" in df_results.columns else df_results[loss_cols]
                 st.line_chart(pdf, height=300)
 
-        with chart_tab1:
-            _plot([c for c in df_results.columns if "loss" in c.lower()])
         with chart_tab2:
-            _plot([c for c in df_results.columns
-                   if any(m in c.lower() for m in ["map", "precision", "recall", "accuracy"])])
+            acc_cols = [c for c in df_results.columns if any(m in c.lower() for m in ["map", "precision", "recall", "accuracy"])]
+            if acc_cols:
+                pdf = df_results.set_index("epoch")[acc_cols] if "epoch" in df_results.columns else df_results[acc_cols]
+                st.line_chart(pdf, height=300)
+
         with chart_tab3:
-            _plot([c for c in df_results.columns if "lr/" in c.lower()])
+            lr_cols = [c for c in df_results.columns if "lr/" in c.lower()]
+            if lr_cols:
+                pdf = df_results.set_index("epoch")[lr_cols] if "epoch" in df_results.columns else df_results[lr_cols]
+                st.line_chart(pdf, height=300)
     else:
         st.info("💡 Real-time metric curves and KPI badges will render here as soon as the first epoch finishes training.")
 
@@ -1186,14 +1172,6 @@ with tab_kaggle:
             k_ds_folder = None
 
         k_ds_title = st.text_input("Kaggle Dataset Title", value=k_ds_folder.name if k_ds_folder else "cctv-yolo-dataset", help="Remote dataset name on Kaggle")
-        k_existing_ds = st.text_input(
-            "Or use existing Kaggle dataset ref(s)",
-            value="",
-            placeholder="user/my-dataset  or  user/ds-p0, user/ds-p1",
-            help="Comma-separated owner/slug refs. If set, the app skips uploading and "
-                 "attaches these directly — use this when you've uploaded the dataset "
-                 "on kaggle.com yourself.",
-        )
         k_job_title = st.text_input("Kaggle Kernel Job Title", value="yolo11-cloud-training", help="Remote kernel notebook name")
         k_target_exp = st.text_input("Local Target Run Name", value="kaggle_exp1", help="Name of folder to save weights into yolo_workspace/runs/")
 
@@ -1230,18 +1208,13 @@ with tab_kaggle:
     if st.button("🚀 Stage Dataset & Dispatch Training to Kaggle GPU", type="primary", disabled=not can_launch, use_container_width=True):
         api = kaggle_bridge.get_kaggle_api()
         with st.status("🚀 Processing Kaggle Remote Job...", expanded=True) as status_box:
-            _manual_refs = [r.strip() for r in k_existing_ds.split(",") if r.strip() and "/" in r]
-            if _manual_refs:
-                status_box.write(f"📎 Using existing Kaggle dataset ref(s): {', '.join(_manual_refs)}")
-                ds_ok, ds_msg, ds_refs = True, f"Attaching {len(_manual_refs)} existing dataset(s).", _manual_refs
-            else:
-                status_box.write("📦 Packaging and verifying dataset for Kaggle...")
-                ds_ok, ds_msg, ds_refs = kaggle_bridge.package_and_upload_dataset(
-                    dataset_path=k_ds_folder,
-                    dataset_title=k_ds_title,
-                    api=api,
-                    progress_callback=lambda msg: status_box.write(f"  ➜ {msg}")
-                )
+            status_box.write("📦 Packaging and verifying dataset for Kaggle...")
+            ds_ok, ds_msg, ds_ref = kaggle_bridge.package_and_upload_dataset(
+                dataset_path=k_ds_folder,
+                dataset_title=k_ds_title,
+                api=api,
+                progress_callback=lambda msg: status_box.write(f"  ➜ {msg}")
+            )
             if not ds_ok:
                 status_box.update(label="❌ Dataset upload failed", state="error")
                 st.error(ds_msg)
@@ -1249,7 +1222,7 @@ with tab_kaggle:
                 status_box.write(f"✅ {ds_msg}")
                 status_box.write("🛰️ Generating remote training script and pushing kernel to Kaggle GPU cluster...")
                 disp_ok, disp_msg, kernel_ref = kaggle_bridge.dispatch_kaggle_training(
-                    dataset_ref=ds_refs,
+                    dataset_ref=ds_ref,
                     kernel_title=k_job_title,
                     model_name=k_model_weight,
                     epochs=k_epochs,
@@ -1261,150 +1234,82 @@ with tab_kaggle:
                     enable_dual_gpu=k_dual_gpu,
                     api=api
                 )
-                # The kernel is created even when attachment can't be confirmed —
-                # record it either way so the dashboard can track it.
-                if kernel_ref:
+                if not disp_ok:
+                    status_box.update(label="❌ Kernel dispatch failed", state="error")
+                    st.error(disp_msg)
+                else:
+                    status_box.update(label="🎉 Job Dispatched to Kaggle GPU Successfully!", state="complete")
+                    st.success(disp_msg)
                     st.session_state.kaggle_active_kernel = kernel_ref
                     kaggle_bridge.save_job_to_history({
                         "kernel_ref": kernel_ref,
-                        "dataset_ref": (", ".join(ds_refs) if isinstance(ds_refs, (list, tuple)) else ds_refs),
-                        "dataset_parts": len(ds_refs) if isinstance(ds_refs, (list, tuple)) else 1,
+                        "dataset_ref": ds_ref,
                         "model_name": k_model_weight,
                         "epochs": k_epochs,
                         "target_exp": k_target_exp,
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     })
-
-                if disp_ok:
-                    status_box.update(label="🎉 Job Dispatched to Kaggle GPU!", state="complete")
-                    st.success(disp_msg)
-                else:
-                    status_box.update(label="⚠️ Dispatched with a warning", state="error")
-                    st.warning(disp_msg)
 
     st.markdown("---")
 
-    # 4. Remote Job Dashboard — all jobs, live status, progress & weight downloads
-    @st.cache_data(ttl=15, show_spinner=False)
-    def _cached_jobs(nonce):
-        return kaggle_bridge.list_all_jobs()
+    # 4. Remote Job Monitor & Ingestion Center
+    st.markdown("#### 📡 Kaggle Remote Job Monitor & Artifact Ingestion")
 
-    st.session_state.setdefault("jobs_nonce", 0)
+    recent_jobs = kaggle_bridge.list_recent_jobs_history()
+    job_options = [j["kernel_ref"] for j in recent_jobs] if recent_jobs else []
+    if st.session_state.kaggle_active_kernel and st.session_state.kaggle_active_kernel not in job_options:
+        job_options.insert(0, st.session_state.kaggle_active_kernel)
 
-    dash_head1, dash_head2 = st.columns([3, 1])
-    with dash_head1:
-        st.markdown("#### 📡 Kaggle Training Jobs")
-    with dash_head2:
-        if st.button("🔄 Refresh Jobs", use_container_width=True):
-            st.session_state.jobs_nonce += 1
-            st.rerun()
+    mon_col1, mon_col2 = st.columns([2, 1])
 
-    with st.spinner("Fetching job status from Kaggle..."):
-        all_jobs = _cached_jobs(st.session_state.jobs_nonce)
+    with mon_col1:
+        active_mon_kernel = st.selectbox(
+            "Select Remote Kernel to Monitor / Ingest",
+            job_options if job_options else ["No remote jobs recorded yet"],
+            index=0 if job_options else 0
+        )
+        refresh_status = st.button("🔄 Refresh Remote Status", use_container_width=True)
 
-    _badge = {
-        "running": "🟢 RUNNING", "queued": "⏳ QUEUED", "unknown": "⚪ STARTING",
-        "complete": "🎉 COMPLETE", "error": "❌ ERROR", "cancelled": "🚫 CANCELLED",
-    }
+    if active_mon_kernel and active_mon_kernel != "No remote jobs recorded yet":
+        k_info = kaggle_bridge.get_kernel_status(active_mon_kernel)
+        st.session_state.kaggle_status_info = k_info
 
-    def _render_job(j, open_default):
-        ref = j["kernel_ref"]
-        status = j["status"]
-        stale = j.get("is_stale")
-        label = _badge.get(status, status.upper())
-        if stale:
-            label = "⏹ ENDED (status expired)"
-        head = f"{label}  ·  {ref.split('/')[-1]}  ·  {j.get('timestamp','')}"
-        _dsr = str(j.get("dataset_ref", "?")).split(",")[0].strip().split("/")[-1]
-        _nparts = j.get("dataset_parts", 1)
-        _ds_disp = f"{_dsr} ({_nparts} parts)" if _nparts and _nparts > 1 else _dsr
-        with st.expander(head, expanded=open_default):
-            st.markdown(
-                f"[🔗 Open in Kaggle Console]({j['url']})  |  "
-                f"Model `{j.get('model_name','?')}` · {j.get('epochs','?')} epochs · "
-                f"dataset `{_ds_disp}` · ⏱ {j.get('elapsed','-')}"
-            )
-            if j.get("failureMessage"):
-                st.error(f"Kernel failure: {j['failureMessage']}")
+        k_stat = k_info.get("status", "unknown")
+        k_url = k_info.get("url", f"https://www.kaggle.com/code/{active_mon_kernel}")
 
-            # Weights + ingest: offered for anything that might have finished.
-            can_have_output = status in ("complete", "error", "cancelled") or stale
-            if can_have_output:
-                exp_name = st.text_input(
-                    "Save into yolo_workspace/runs/",
-                    value=j.get("target_exp") or "kaggle_exp1", key=f"exp_{ref}",
-                )
-                wc1, wc2, wc3 = st.columns(3)
-                with wc1:
-                    if st.button("⬇ Fetch best.pt & last.pt", key=f"w_{ref}",
-                                 type="primary", use_container_width=True):
-                        with st.spinner("Downloading weights from Kaggle..."):
-                            ok, msg, saved = kaggle_bridge.download_weights(
-                                ref, dest_dir=kaggle_bridge.RUNS_DIR / exp_name / "weights")
-                        (st.success if ok else st.warning)(msg)
-                        st.session_state[f"weights_{ref}"] = (
-                            {k: str(v) for k, v in saved.items()} if ok else {})
-                with wc2:
-                    if st.button("📥 Ingest full run", key=f"ing_{ref}", use_container_width=True):
-                        with st.spinner("Downloading run output from Kaggle..."):
-                            ok, msg, _ = kaggle_bridge.download_and_ingest_artifacts(ref, exp_name)
-                        (st.success if ok else st.warning)(msg)
-                with wc3:
-                    if st.button("📄 View log", key=f"log_{ref}", use_container_width=True):
-                        with st.spinner("Pulling log from Kaggle..."):
-                            prog = kaggle_bridge.get_training_progress(ref)
-                        if prog.get("error_line"):
-                            st.warning(f"Likely cause: {prog['error_line']}")
-                        st.code(prog.get("tail") or "(no log available yet)", language="log")
-
-                for wname, wpath in (st.session_state.get(f"weights_{ref}") or {}).items():
-                    try:
-                        with open(wpath, "rb") as fh:
-                            st.download_button(
-                                f"💾 Download {wname}", data=fh.read(),
-                                file_name=f"{ref.split('/')[-1]}_{wname}",
-                                mime="application/octet-stream",
-                                key=f"dl_{ref}_{wname}", use_container_width=True)
-                    except OSError:
-                        pass
+        with mon_col2:
+            st.markdown(f"**Web Link:** [🔗 Open in Kaggle Console]({k_url})")
+            if k_stat in ["running", "queued"]:
+                st.markdown(f'<span class="status-badge status-running">🟢 Status: {k_stat.upper()}</span>', unsafe_allow_html=True)
+            elif k_stat in ["complete"]:
+                st.markdown('<span class="status-badge status-idle" style="color: #10b981; border-color: #10b981;">🎉 Status: COMPLETE</span>', unsafe_allow_html=True)
+            elif k_stat in ["error"]:
+                st.markdown('<span class="status-badge status-paused" style="color: #ef4444; border-color: #ef4444;">❌ Status: ERROR</span>', unsafe_allow_html=True)
             else:
-                if st.button("📊 Fetch progress / log", key=f"prog_{ref}", use_container_width=True):
-                    with st.spinner("Pulling latest log from Kaggle..."):
-                        prog = kaggle_bridge.get_training_progress(ref)
-                    if prog.get("epoch") and prog.get("total_epochs"):
-                        st.progress((prog.get("pct") or 0) / 100.0)
-                        st.caption(f"Epoch {prog['epoch']} / {prog['total_epochs']} · {prog.get('pct',0)}%")
-                    m = prog.get("metrics") or {}
-                    if m:
-                        mc = st.columns(4)
-                        mc[0].metric("mAP@50", f"{m.get('mAP50',0):.3f}")
-                        mc[1].metric("mAP@50-95", f"{m.get('mAP50_95',0):.3f}")
-                        mc[2].metric("Precision", f"{m.get('precision',0):.3f}")
-                        mc[3].metric("Recall", f"{m.get('recall',0):.3f}")
-                    if prog.get("log_available"):
-                        st.code(prog.get("tail") or "(log empty)", language="log")
+                st.markdown(f'<span class="status-badge status-idle">⚪ Status: {k_stat.upper()}</span>', unsafe_allow_html=True)
+
+        if k_stat == "error" and k_info.get("failureMessage"):
+            st.error(f"Kernel Failure: {k_info.get('failureMessage')}")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Artifact Ingestion Section
+        ingest_col1, ingest_col2 = st.columns([2, 1])
+        with ingest_col1:
+            dest_exp = st.text_input("Destination Folder in yolo_workspace/runs/", value=k_target_exp, key="dest_exp_input")
+        with ingest_col2:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            if st.button("📥 Ingest Checkpoints (best.pt & results.csv)", type="primary", use_container_width=True):
+                with st.spinner("Downloading output artifacts from Kaggle Cloud..."):
+                    dl_ok, dl_msg, downloaded_path = kaggle_bridge.download_and_ingest_artifacts(
+                        kernel_ref=active_mon_kernel,
+                        target_exp_name=dest_exp
+                    )
+                    if dl_ok:
+                        st.success(dl_msg)
+                        st.toast(f"Checkpoints ingested into {dest_exp}!", icon="🎯")
                     else:
-                        st.info("Kaggle serves the run log after the session ends. Status above "
-                                "is live — check back shortly, or open the Kaggle console.")
-
-            if st.button("🗑 Remove from this list", key=f"del_{ref}"):
-                kaggle_bridge.delete_job_from_history(ref)
-                st.session_state.jobs_nonce += 1
-                st.rerun()
-
-    if not all_jobs:
-        st.info("No training jobs dispatched yet. Launch one above and it will appear here.")
-    else:
-        ongoing = [j for j in all_jobs if j.get("is_ongoing")]
-        finished = [j for j in all_jobs if not j.get("is_ongoing")]
-        if ongoing:
-            st.markdown(f"**Ongoing — {len(ongoing)}**")
-            for j in ongoing:
-                _render_job(j, open_default=True)
-        if finished:
-            st.markdown(f"**Completed / Failed — {len(finished)}**")
-            for j in finished:
-                _render_job(j, open_default=(j["status"] == "complete"))
+                        st.error(dl_msg)
 
     # 5. Standalone Notebook Template Expander
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1878,8 +1783,7 @@ with tab_history:
                 if dft is not None and comp_m in dft.columns and "epoch" in dft.columns:
                     comp_df[rn] = dft.set_index("epoch")[comp_m]
 
-            comp_df = comp_df.apply(pd.to_numeric, errors="coerce").dropna(how="all")
             if not comp_df.empty:
                 st.line_chart(comp_df, height=350)
             else:
-                st.caption(f"No numeric `{comp_m}` data in the selected runs.")
+                st.caption(f"No metric `{comp_m}` found in selected runs.")
