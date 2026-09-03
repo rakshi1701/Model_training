@@ -10,9 +10,11 @@ Handles:
 
 import os
 import sys
+import re
 import json
 import shutil
 import zipfile
+import tarfile
 import subprocess
 import tempfile
 import time
@@ -29,6 +31,29 @@ KAGGLE_CONFIG_ACCESS_TOKEN = KAGGLE_CONFIG_DIR / "access_token"
 WORKSPACE_DIR = Path(__file__).parent / "yolo_workspace"
 RUNS_DIR = WORKSPACE_DIR / "runs"
 KAGGLE_STAGING_DIR = WORKSPACE_DIR / "temp" / "kaggle_staging"
+JOBS_HISTORY_FILE = WORKSPACE_DIR / "kaggle_jobs.json"
+DATASET_MAP_FILE = WORKSPACE_DIR / "kaggle_dataset_map.json"
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+# Files that must never be shipped to Kaggle inside the dataset.
+STAGE_IGNORE = shutil.ignore_patterns(
+    "*.cache", ".*", "__pycache__", "*.pyc", "runs", "wandb", "*.zip",
+)
+
+
+def _load_json(path: Path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return default
+
+
+def _save_json(path: Path, obj):
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(obj, indent=2))
+    except Exception:
+        pass
 
 
 def safe_rmtree(path: Path):
@@ -262,16 +287,168 @@ def format_dataset_slug(name: str) -> str:
     return slug or "yolo-dataset"
 
 
+def _resp_error(resp) -> Optional[str]:
+    """dataset_create_* / kernels_push return a response object instead of raising
+    on server-side errors (title clash, permission denied, invalid owner, ...)."""
+    if resp is None:
+        return None
+    status = str(getattr(resp, "status", "") or "")
+    err = str(getattr(resp, "error", "") or getattr(resp, "errorNullable", "") or "")
+    if err:
+        return err
+    if status and status.lower() not in ("ok", "created", "success", "complete"):
+        return f"Kaggle returned status '{status}'."
+    return None
+
+
+def _owned_dataset_refs(api, username: str) -> List[str]:
+    """Lowercase 'owner/slug' refs of datasets this account owns."""
+    refs: List[str] = []
+    if api is None:
+        return refs
+    for kwargs in ({"mine": True}, {"user": username}):
+        try:
+            ds_list = api.dataset_list(**kwargs)
+            for d in ds_list:
+                ref = getattr(d, "ref", None)
+                if not ref:
+                    s = str(d)
+                    if '"ref": "' in s:
+                        ref = s.split('"ref": "')[1].split('"')[0]
+                    elif "/" in s:
+                        ref = s.strip()
+                if ref:
+                    refs.append(str(ref).strip("/").lower())
+            if refs:
+                break
+        except Exception:
+            continue
+    return refs
+
+
+def _count_images(root: Path) -> int:
+    return sum(1 for p in Path(root).rglob("*") if p.suffix.lower() in IMAGE_EXTS)
+
+
+def _dataset_fingerprint(root: Path) -> str:
+    """Cheap change-detector: image count + newest mtime across images & yaml."""
+    root = Path(root)
+    n, newest = 0, 0.0
+    for p in root.rglob("*"):
+        sfx = p.suffix.lower()
+        if sfx in IMAGE_EXTS or sfx in (".yaml", ".yml", ".txt"):
+            try:
+                newest = max(newest, p.stat().st_mtime)
+                if sfx in IMAGE_EXTS:
+                    n += 1
+            except OSError:
+                pass
+    return f"{n}:{int(newest)}"
+
+
+_SKIP_DIRS = {"runs", "wandb", "__pycache__", ".git"}
+_SKIP_SUFFIX = {".cache", ".zip"}
+
+
+def _dataset_status(ref: str, api=None) -> str:
+    """Returns 'ready', 'error', 'initializing', or raw progress state like 'blobs_decompressed'."""
+    if api is None:
+        api = get_kaggle_api()
+        if api is None:
+            return "?"
+    try:
+        raw = api.dataset_status(ref)
+        st = str(raw).strip().lower()
+        if st in ("ready", "complete", "success"):
+            return "ready"
+        if st in ("failed", "error", "deleted"):
+            return "error"
+        return st
+    except Exception as e:
+        msg = str(e)
+        if "403" in msg or "404" in msg:
+            # During initial creation or replica sync, Kaggle's status endpoint
+            # returns 403 or 404 until the record is indexed across replicas.
+            return "initializing"
+        return "?"
+
+
+def _collect_dataset_files(dataset_path: Path) -> List[Path]:
+    out: List[Path] = []
+    for p in dataset_path.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(dataset_path)
+        if (any(part.startswith(".") or part in _SKIP_DIRS for part in rel.parts)
+                or p.name == "dataset-metadata.json"
+                or p.suffix.lower() in _SKIP_SUFFIX):
+            continue
+        out.append(p)
+    return out
+
+
+def _stage_clean_dataset(staging_dir: Path, dataset_path: Path, progress_callback=None):
+    """Packages dataset into a fast zip archive (dataset.zip) and root data.yaml.
+    Uploading an archive with dir_mode='skip' prevents Kaggle's server-side decompressor
+    from stalling on thousands of individual image files, enabling immediate 'ready' status."""
+    safe_rmtree(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    yaml_file = None
+    for yf in ("data.yaml", "dataset.yaml", "data.yml"):
+        if (dataset_path / yf).exists():
+            yaml_file = dataset_path / yf
+            break
+
+    import yaml
+    if yaml_file:
+        try:
+            with open(yaml_file, "r") as f:
+                cfg = yaml.safe_load(f) or {}
+            # Normalize relative paths like ../train/images -> train/images
+            for key in ["train", "val", "valid", "test"]:
+                val = cfg.get(key)
+                if isinstance(val, str):
+                    cfg[key] = val.replace("../", "").strip("/")
+            with open(staging_dir / "data.yaml", "w") as f:
+                yaml.dump(cfg, f, default_flow_style=False)
+        except Exception:
+            shutil.copy2(yaml_file, staging_dir / "data.yaml")
+
+    # Fast archive creation using uncompressed tar (linear speed, zero compression CPU overhead)
+    # Kaggle does not decompress .tar archives server-side, bypassing the 1,000-file limit
+    # and allowing the dataset to be verified as 'ready' on Kaggle in seconds.
+    t0 = time.time()
+    tar_path = staging_dir / "dataset.tar"
+    with tarfile.open(tar_path, "w") as tf:
+        for item in dataset_path.iterdir():
+            if item.name.startswith(".") or item.name in _SKIP_DIRS:
+                continue
+            if item.is_file():
+                if item.suffix.lower() not in _SKIP_SUFFIX and item.name != "dataset-metadata.json":
+                    tf.add(item, arcname=item.name)
+            elif item.is_dir():
+                for sub in item.rglob("*"):
+                    if sub.is_file():
+                        if sub.suffix.lower() in _SKIP_SUFFIX or any(p.startswith(".") for p in sub.parts):
+                            continue
+                        tf.add(sub, arcname=sub.relative_to(dataset_path).as_posix())
+
+    sz_mb = tar_path.stat().st_size / (1024 * 1024)
+    if progress_callback:
+        progress_callback(f"Packaged {sz_mb:.1f} MB archive (dataset.tar) in {time.time()-t0:.1f}s.")
+
+
 def package_and_upload_dataset(
     dataset_path: Path,
     dataset_title: str,
     api=None,
-    progress_callback=None
-) -> Tuple[bool, str, Optional[str]]:
+    progress_callback=None,
+) -> Tuple[bool, str, Optional[List[str]]]:
     """
-    Validates a local YOLO dataset directory, creates dataset-metadata.json,
-    and uploads or versions it on Kaggle using dir_mode='zip' to preserve subfolders.
-    Returns: (success, message, dataset_ref)
+    Uploads a local YOLO dataset to Kaggle as a native dataset archive with immediate verification.
+    Reuses existing dataset if unchanged (by fingerprint).
+    Returns: (success, message, [dataset_ref]).
     """
     if api is None:
         api = get_kaggle_api()
@@ -282,86 +459,143 @@ def package_and_upload_dataset(
     if not dataset_path.exists():
         return False, f"Dataset path {dataset_path} does not exist.", None
 
-    yaml_file = None
-    for yf in ["data.yaml", "dataset.yaml", "data.yml"]:
-        candidate = dataset_path / yf
-        if candidate.exists():
-            yaml_file = candidate
-            break
+    if not any((dataset_path / y).exists() for y in ("data.yaml", "dataset.yaml", "data.yml")):
+        return False, f"No data.yaml in {dataset_path}.", None
 
-    if not yaml_file:
-        return False, "No data.yaml found in dataset directory.", None
+    files = _collect_dataset_files(dataset_path)
+    images = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
+    if not images:
+        return False, f"No images found under {dataset_path}.", None
+    total_bytes = sum(f.stat().st_size for f in files)
+    size_mb = total_bytes // (1024 * 1024)
 
-    auth_ok, username, _ = is_authenticated()
+    username = _read_username_hint()
     if not username:
-        return False, "Could not determine Kaggle username.", None
+        _, username, err = is_authenticated()
+        if not username:
+            return False, err or "Could not determine Kaggle username.", None
 
-    dataset_slug = format_dataset_slug(dataset_title)
-    dataset_ref = f"{username}/{dataset_slug}"
+    base_slug = format_dataset_slug(dataset_title)
+    fingerprint = _dataset_fingerprint(dataset_path)
+    ds_map = _load_json(DATASET_MAP_FILE, {})
+    entry = ds_map.get(base_slug) or {}
 
-    staging_dir = KAGGLE_STAGING_DIR / "dataset" / dataset_slug
-    safe_rmtree(staging_dir)
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    cached_ref = entry.get("ref") or (entry.get("parts", {}).get("0") if isinstance(entry.get("parts"), dict) else None)
+    if entry.get("fingerprint") == fingerprint and cached_ref:
+        if _dataset_status(cached_ref, api) == "ready":
+            return True, f"Reusing Kaggle dataset '{cached_ref}' (unchanged, {len(images)} images).", [cached_ref]
+
+    owned = set(_owned_dataset_refs(api, username))
+    target_ref = f"{username}/{base_slug}"
+
+    # If the user already owns this exact slug, we update its version.
+    # Otherwise, append a unique timestamp to prevent global Kaggle title/slug clashes.
+    if target_ref.lower() in owned:
+        dataset_ref = target_ref
+        dataset_title_clean = dataset_title
+        already_exists = True
+    else:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dataset_ref = f"{username}/{base_slug}-{stamp}"
+        dataset_title_clean = f"{dataset_title} ({stamp})"
+        already_exists = False
+
+    slug_part = dataset_ref.split("/")[-1]
+    staging_dir = KAGGLE_STAGING_DIR / "dataset" / slug_part
 
     if progress_callback:
-        progress_callback("Staging dataset files for Kaggle...")
+        progress_callback(f"Staging {len(images)} images ({size_mb} MB) into fast dataset archive...")
 
-    # Copy files to staging
-    for item in dataset_path.iterdir():
-        if item.name.startswith("."):
-            continue
-        dest = staging_dir / item.name
-        if item.is_dir():
-            shutil.copytree(item, dest)
-        else:
-            shutil.copy2(item, dest)
-
-    # Generate dataset-metadata.json
-    metadata = {
-        "title": dataset_title,
-        "id": dataset_ref,
-        "licenses": [{"name": "CC0-1.0"}]
-    }
-    with open(staging_dir / "dataset-metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
+    _stage_clean_dataset(staging_dir, dataset_path, progress_callback)
+    _save_json(
+        staging_dir / "dataset-metadata.json",
+        {"title": dataset_title_clean[:50], "id": dataset_ref, "licenses": [{"name": "CC0-1.0"}]}
+    )
 
     if progress_callback:
-        progress_callback("Uploading dataset to Kaggle (zipping folders)...")
+        action_name = "Updating version of existing" if already_exists else "Uploading new"
+        progress_callback(f"{action_name} dataset '{dataset_ref}' on Kaggle...")
 
-    try:
-        existing_datasets = [str(d) for d in api.dataset_list(user=username)]
-        dataset_exists = any(dataset_ref.lower() in d.lower() for d in existing_datasets)
-
-        if dataset_exists:
-            api.dataset_create_version(
+    upload_err = None
+    if already_exists:
+        try:
+            resp = api.dataset_create_version(
                 folder=str(staging_dir),
                 version_notes=f"Updated from YOLO Studio at {time.strftime('%Y-%m-%d %H:%M:%S')}",
-                quiet=False,
-                dir_mode="zip"
+                quiet=True,
+                dir_mode="skip"
             )
-            return True, f"Dataset '{dataset_ref}' updated with new version.", dataset_ref
-        else:
-            api.dataset_create_new(
+            upload_err = _resp_error(resp)
+        except Exception as e:
+            upload_err = str(e)
+    else:
+        try:
+            resp = api.dataset_create_new(
                 folder=str(staging_dir),
                 public=False,
-                quiet=False,
-                dir_mode="zip"
+                quiet=True,
+                dir_mode="skip"
             )
-            return True, f"Private dataset '{dataset_ref}' successfully created on Kaggle.", dataset_ref
-    except Exception as e:
-        err_msg = str(e)
-        if "already exists" in err_msg.lower() or "duplicate" in err_msg.lower():
+            upload_err = _resp_error(resp)
+        except Exception as e:
+            upload_err = str(e)
+
+        if upload_err and any(phrase in upload_err.lower() for phrase in ["already in use", "duplicate", "already exists"]):
+            if progress_callback:
+                progress_callback(f"Title in use on Kaggle; re-trying with unique title...")
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dataset_ref = f"{username}/{base_slug}-{stamp}"
+            dataset_title_clean = f"{dataset_title} ({stamp})"
+            _save_json(
+                staging_dir / "dataset-metadata.json",
+                {"title": dataset_title_clean[:50], "id": dataset_ref, "licenses": [{"name": "CC0-1.0"}]}
+            )
             try:
-                api.dataset_create_version(
+                resp = api.dataset_create_new(
                     folder=str(staging_dir),
-                    version_notes="Updated from YOLO Studio",
-                    quiet=False,
-                    dir_mode="zip"
+                    public=False,
+                    quiet=True,
+                    dir_mode="skip"
                 )
-                return True, f"Dataset '{dataset_ref}' updated with a new version.", dataset_ref
+                upload_err = _resp_error(resp)
             except Exception as e2:
-                return False, f"Dataset upload failed: {str(e2)}", None
-        return False, f"Dataset upload error: {err_msg}", None
+                upload_err = str(e2)
+
+    if upload_err:
+        return False, f"Failed to upload dataset to Kaggle: {upload_err}", None
+
+    if progress_callback:
+        progress_callback(f"Upload complete. Verifying Kaggle dataset '{dataset_ref}'...")
+
+    ready = False
+    for poll in range(20):
+        time.sleep(4)
+        st = _dataset_status(dataset_ref, api)
+        if st == "ready":
+            ready = True
+            break
+        elif st == "error":
+            return False, f"Kaggle marked dataset '{dataset_ref}' as failed.", None
+        else:
+            if progress_callback:
+                status_desc = "initializing/syncing" if st == "initializing" else st
+                progress_callback(f"  ➜ Kaggle processing state: {status_desc} (elapsed: {(poll+1)*4}s)...")
+
+    if not ready:
+        return False, f"Dataset '{dataset_ref}' upload completed, but verification timed out. Check: https://www.kaggle.com/datasets/{dataset_ref}", None
+
+    ds_map[base_slug] = {
+        "ref": dataset_ref,
+        "parts": {"0": dataset_ref},
+        "fingerprint": fingerprint,
+        "n_parts": 1
+    }
+    _save_json(DATASET_MAP_FILE, ds_map)
+
+    if progress_callback:
+        progress_callback(f"Dataset '{dataset_ref}' is ready on Kaggle!")
+
+    return True, f"Dataset '{dataset_ref}' uploaded and verified ready on Kaggle ({len(images)} images).", [dataset_ref]
 
 
 def generate_remote_training_script(
@@ -395,11 +629,43 @@ print("=" * 60)
 print("🚀 Initializing YOLO Training Environment on Kaggle GPU")
 print("=" * 60)
 
+# --- GPU / PyTorch ABI guard -------------------------------------------------
+# Kaggle's current base image ships a CUDA 12.8 PyTorch build that dropped
+# support for older GPUs (Tesla P100 = compute capability sm_60). API-pushed
+# GPU kernels are frequently scheduled onto a P100, where that torch silently
+# refuses the device. If we detect a P100, install a torch build that still
+# supports sm_60 BEFORE importing torch.
+try:
+    _gpu_name = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=30
+    ).stdout.strip()
+except Exception:
+    _gpu_name = ""
+print(f"🖥️ Detected accelerator: {{_gpu_name or 'none / CPU'}}")
+
+if "P100" in _gpu_name:
+    print("🔧 P100 detected — installing a P100-compatible PyTorch (cu121)...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "--quiet",
+        "torch==2.4.1", "torchvision==0.19.1",
+        "--index-url", "https://download.pytorch.org/whl/cu121",
+    ])
+
 subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "ultralytics", "pyyaml"])
 
 import torch
 import yaml
 from ultralytics import YOLO
+
+# Verify torch can actually use the assigned GPU; fall back loudly if not.
+if torch.cuda.is_available():
+    _cap = torch.cuda.get_device_capability(0)
+    _tag = f"sm_{{_cap[0]}}{{_cap[1]}}"
+    _arch = torch.cuda.get_arch_list()
+    print(f"🔩 torch {{torch.__version__}} | device {{_tag}} | supported {{_arch}}")
+    if _tag not in _arch:
+        print(f"⚠️ torch build does not list {{_tag}} — training may fall back to CPU.")
 
 cuda_avail = torch.cuda.is_available()
 gpu_count = torch.cuda.device_count() if cuda_avail else 0
@@ -420,31 +686,97 @@ else:
     print("⚠️ No GPU detected. Falling back to CPU.")
 
 # 2. Locate Dataset
+import zipfile
 input_root = Path("/kaggle/input")
 dataset_dir = None
 
-# Search for data.yaml in /kaggle/input
-for root, dirs, files in os.walk(input_root):
-    if "data.yaml" in files or "dataset.yaml" in files:
-        dataset_dir = Path(root)
-        break
+print("📂 Contents of /kaggle/input:")
+_listing = sorted(str(p) for p in input_root.rglob("*"))
+for _p in _listing[:60]:
+    print("   ", _p)
+if not _listing:
+    print("    <empty> — no dataset is attached to this kernel!")
 
-if not dataset_dir:
-    raise FileNotFoundError(f"Could not locate data.yaml under {{input_root}}")
+def _find_yaml_dirs(base):
+    hits = []
+    for root, dirs, files in os.walk(base):
+        if "data.yaml" in files or "dataset.yaml" in files:
+            hits.append(Path(root))
+    return hits
 
-yaml_file = dataset_dir / ("data.yaml" if (dataset_dir / "data.yaml").exists() else "dataset.yaml")
-print(f"📁 Located Dataset YAML: {{yaml_file}}")
+# 2. Locate Dataset (support raw directories, tar archives, and zip archives)
+import tarfile
+all_archives = sorted(list(input_root.rglob("*.tar")) + list(input_root.rglob("*.tar.gz")) + list(input_root.rglob("*.zip")))
+if all_archives:
+    print(f"📦 Found {{len(all_archives)}} dataset archive(s). Unpacking into /kaggle/working/_extracted...")
+    extract_root = Path("/kaggle/working/_extracted")
+    extract_root.mkdir(parents=True, exist_ok=True)
+    for a in all_archives:
+        print(f"   Extracting {{a.name}} ({{a.stat().st_size / (1024*1024):.1f}} MB)...")
+        if a.name.endswith(".zip"):
+            with zipfile.ZipFile(a) as zf:
+                zf.extractall(extract_root)
+        else:
+            with tarfile.open(a) as tf:
+                tf.extractall(extract_root)
+    yaml_dirs = _find_yaml_dirs(extract_root)
+else:
+    yaml_dirs = _find_yaml_dirs(input_root)
 
-# Read and fix paths in data.yaml for Kaggle runtime
+if not yaml_dirs:
+    raise FileNotFoundError(
+        f"Could not locate data.yaml under {{input_root}}. "
+        f"No dataset attached / archives did not extract. Check the Input panel."
+    )
+
+print(f"📁 Dataset mount(s) with data.yaml: {{[str(d) for d in yaml_dirs]}}")
+primary = yaml_dirs[0]
+yaml_file = primary / ("data.yaml" if (primary / "data.yaml").exists() else "dataset.yaml")
 with open(yaml_file, "r") as f:
     data_cfg = yaml.safe_load(f)
 
-# Ensure absolute paths pointing to /kaggle/input
-data_cfg["path"] = str(dataset_dir)
+# Merge every mount's train/valid/test into one writable tree via symlinks.
+merged_root = Path("/kaggle/working/dataset")
+safe_split = {{"train": "train", "val": "valid", "test": "test"}}
+counts = {{}}
+for key, folder in safe_split.items():
+    for sub in ("images", "labels"):
+        (merged_root / folder / sub).mkdir(parents=True, exist_ok=True)
+    n = 0
+    for mount in yaml_dirs:
+        for cand in (mount / folder, mount / key):
+            if not cand.is_dir():
+                continue
+            for sub in ("images", "labels"):
+                srcd = cand / sub
+                if not srcd.is_dir():
+                    continue
+                for fp in srcd.iterdir():
+                    if not fp.is_file() or fp.suffix.lower() == ".cache":
+                        continue
+                    dst = merged_root / folder / sub / fp.name
+                    if not dst.exists():
+                        try:
+                            os.symlink(fp, dst)
+                        except OSError:
+                            shutil.copy2(fp, dst)
+                        if sub == "images":
+                            n += 1
+    counts[key] = n
+    if n:
+        data_cfg[key] = str(merged_root / folder / "images")
+    elif key in ("train", "val"):
+        raise FileNotFoundError(f"No '{{folder}}' images found across any mount.")
+    else:
+        data_cfg.pop(key, None)
+    data_cfg.pop(folder if folder != key else "___", None)
+
+data_cfg["path"] = str(merged_root)
+print(f"🔗 Merged image counts: {{counts}}")
+
 patched_yaml = Path("/kaggle/working/data_kaggle.yaml")
 with open(patched_yaml, "w") as f:
     yaml.dump(data_cfg, f, default_flow_style=False)
-
 print(f"✅ Patched Kaggle Data Config written to {{patched_yaml}}")
 
 # 3. Model Training
@@ -455,10 +787,8 @@ print("=" * 60)
 print("🏋️ Starting Training: Model={model_name} | Epochs={epochs} | Batch={batch_size} | ImgSz={imgsz}")
 print("=" * 60)
 
-model = YOLO("{model_name}")
-
-try:
-    results = model.train(
+def _run_training(dev):
+    return YOLO("{model_name}").train(
         data=str(patched_yaml),
         epochs={epochs},
         batch={batch_size},
@@ -466,37 +796,51 @@ try:
         optimizer="{optimizer}",
         lr0={lr0},
         patience={patience},
-        device=devices,
+        device=dev,
         project=str(project_dir),
         name=exp_name,
         exist_ok=True,
         plots=True,
         save=True,
-        verbose=True
+        verbose=True,
     )
+
+try:
+    try:
+        results = _run_training(devices)
+    except Exception as e:
+        # Multi-GPU DDP can be flaky inside a Kaggle script kernel; retry on 1 GPU.
+        if isinstance(devices, list):
+            print(f"⚠️ Multi-GPU run failed ({{e}}); retrying on a single GPU...")
+            results = _run_training(0)
+        else:
+            raise
     print("🎉 Training Completed Successfully!")
 except Exception as e:
     print(f"❌ Training Failed: {{e}}")
-    raise e
+    raise
 
-# 4. Package Artifacts for 1-Click Download
+# 4. Package artifacts into /kaggle/working/output/ for 1-click download
 run_output_dir = project_dir / exp_name
 output_archive_dir = Path("/kaggle/working/output")
 output_archive_dir.mkdir(parents=True, exist_ok=True)
 
-if run_output_dir.exists():
-    print("📦 Packaging weights, metrics, and plots for local synchronization...")
-    for item in run_output_dir.iterdir():
-        dest = output_archive_dir / item.name
-        if item.is_dir():
-            shutil.copytree(item, dest, dirs_exist_ok=True)
-        else:
-            shutil.copy2(item, dest)
-    print("✅ All artifacts staged in /kaggle/working/output/")
-else:
-    print("⚠️ Run directory not found. Archiving entire project folder.")
-    shutil.copytree(project_dir, output_archive_dir, dirs_exist_ok=True)
+src_dir = run_output_dir if run_output_dir.exists() else project_dir
+print(f"📦 Packaging artifacts from {{src_dir}} ...")
+for item in src_dir.iterdir():
+    dest = output_archive_dir / item.name
+    if item.is_dir():
+        shutil.copytree(item, dest, dirs_exist_ok=True)
+    else:
+        shutil.copy2(item, dest)
 
+# Guarantee best.pt / last.pt sit at a predictable top level too.
+for w in src_dir.rglob("*.pt"):
+    if w.name in ("best.pt", "last.pt"):
+        shutil.copy2(w, output_archive_dir / w.name)
+
+found = sorted(p.name for p in output_archive_dir.rglob("*") if p.is_file())
+print(f"✅ Staged {{len(found)}} files in /kaggle/working/output/: {{found[:20]}}")
 print("=" * 60)
 print("🏁 Kaggle Job Completed. Ready for local download!")
 print("=" * 60)
@@ -504,7 +848,7 @@ print("=" * 60)
 
 
 def dispatch_kaggle_training(
-    dataset_ref: str,
+    dataset_ref,
     kernel_title: str,
     model_name: str,
     epochs: int,
@@ -517,19 +861,30 @@ def dispatch_kaggle_training(
     api=None
 ) -> Tuple[bool, str, Optional[str]]:
     """
-    Generates remote training script, kernel-metadata.json, and pushes kernel to Kaggle.
-    Returns: (success, message, kernel_ref)
+    Generates remote training script, kernel-metadata.json, and pushes kernel to
+    Kaggle. `dataset_ref` may be a single 'owner/slug' or a list of them (the
+    training script merges multi-part datasets). Returns: (success, message, kernel_ref)
     """
     if api is None:
         api = get_kaggle_api()
         if api is None:
             return False, "Kaggle API authentication failed. Please configure API token.", None
 
-    auth_ok, username, _ = is_authenticated()
+    username = _read_username_hint()
     if not username:
-        return False, "Unable to get Kaggle username.", None
+        _, username, err = is_authenticated()
+        if not username:
+            return False, err or "Unable to get Kaggle username.", None
 
-    kernel_slug = format_dataset_slug(kernel_title)
+    dataset_refs = [dataset_ref] if isinstance(dataset_ref, str) else list(dataset_ref or [])
+    dataset_refs = [r for r in dataset_refs if r and "/" in r]
+    if not dataset_refs:
+        return False, f"Invalid dataset reference(s): {dataset_ref!r}", None
+
+    # Unique slug per dispatch so each run is its own trackable kernel (Kaggle
+    # otherwise overwrites the previous kernel + its logs/output).
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    kernel_slug = f"{format_dataset_slug(kernel_title)}-{stamp}"
     kernel_ref = f"{username}/{kernel_slug}"
 
     staging_dir = KAGGLE_STAGING_DIR / "kernel" / kernel_slug
@@ -539,7 +894,7 @@ def dispatch_kaggle_training(
     # 1. Generate train_remote.py
     script_content = generate_remote_training_script(
         model_name=model_name,
-        dataset_slug=dataset_ref.split("/")[-1],
+        dataset_slug=dataset_refs[0].split("/")[-1],
         epochs=epochs,
         batch_size=batch_size,
         imgsz=imgsz,
@@ -555,26 +910,89 @@ def dispatch_kaggle_training(
     # 2. Generate kernel-metadata.json
     metadata = {
         "id": kernel_ref,
-        "title": kernel_title,
+        "title": kernel_slug[:50],
         "code_file": "train_remote.py",
         "language": "python",
         "kernel_type": "script",
-        "is_private": "true",
-        "enable_gpu": "true",
-        "enable_tpu": "false",
-        "enable_internet": "true",
-        "dataset_sources": [dataset_ref]
+        "is_private": True,
+        "enable_gpu": True,
+        "enable_tpu": False,
+        "enable_internet": True,
+        "dataset_sources": list(dataset_refs),
     }
-    with open(staging_dir / "kernel-metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
+    _save_json(staging_dir / "kernel-metadata.json", metadata)
 
-    # 3. Push kernel (kernels_push is the library call; kernels_push_cli is a
-    # thin CLI wrapper whose 'timeout' arg has no default in kaggle >=1.7).
+    want = {r.strip("/").lower() for r in dataset_refs}
+
+    # 3a. Wait for ALL dataset parts to be visible on the account BEFORE pushing
+    #     - Kaggle validates datasources at push time and silently drops any it
+    #     cannot resolve yet, so pushing too early yields dataset_sources: [].
+    n_visible = 0
+    for _ in range(36):                          # up to ~6 min
+        owned = set(_owned_dataset_refs(api, username))
+        n_visible = sum(1 for r in want if r in owned)
+        if n_visible == len(want):
+            break
+        time.sleep(10)
+
+    # 3b. Push, then POLL the stored metadata until every datasource lands.
+    def _push() -> Optional[str]:
+        try:
+            resp = api.kernels_push(folder=str(staging_dir), timeout=None)
+            return _resp_error(resp)
+        except Exception as e:
+            return str(e)
+
+    push_err = _push()
+    if push_err:
+        return False, f"Failed to push kernel to Kaggle: {push_err}", None
+
+    attached, repushes = False, 0
+    for i in range(18):                          # up to ~3 min of polling
+        time.sleep(10)
+        state = _kernel_dataset_state(api, kernel_ref, dataset_refs)
+        if state is True:
+            attached = True
+            break
+        if state is False and repushes < 3 and i % 4 == 3:
+            _push()
+            repushes += 1
+
+    parts_txt = (f"{len(dataset_refs)} dataset part(s)" if len(dataset_refs) > 1
+                 else f"dataset '{dataset_refs[0]}'")
+    if attached:
+        return True, f"Dispatched to Kaggle GPU with {parts_txt} attached. (Kernel: {kernel_ref})", kernel_ref
+
+    if state is None:
+        return True, f"Dispatched to Kaggle GPU (Kernel: {kernel_ref}). Kernel pushed with {parts_txt}; attach verification deferred.", kernel_ref
+
+    hint = ("dataset part(s) still processing on Kaggle" if n_visible < len(want)
+            else "Kaggle dropped the datasource(s) at push time")
+    return False, (
+        f"Kernel '{kernel_ref}' was pushed but {parts_txt} not attached ({hint}). "
+        f"Wait ~5 min, then hit Dispatch again - it skips the re-upload and just "
+        f"re-attaches. Or add the dataset(s) under the kernel's Input panel on Kaggle."
+    ), kernel_ref
+
+
+def _kernel_dataset_state(api, kernel_ref: str, dataset_refs) -> Optional[bool]:
+    """True = all datasources present, False = one confirmed absent, None = can't check."""
+    if isinstance(dataset_refs, str):
+        dataset_refs = [dataset_refs]
+    want = {r.strip("/").lower() for r in dataset_refs}
     try:
-        api.kernels_push(folder=str(staging_dir), timeout=None)
-        return True, f"Training job successfully dispatched to Kaggle GPU cluster! (Kernel: {kernel_ref})", kernel_ref
-    except Exception as e:
-        return False, f"Failed to push kernel to Kaggle: {str(e)}", None
+        probe_dir = KAGGLE_STAGING_DIR / "kernel_probe"
+        safe_rmtree(probe_dir)
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        api.kernels_pull(kernel_ref, path=str(probe_dir), metadata=True)
+        meta_path = probe_dir / "kernel-metadata.json"
+        if not meta_path.exists():
+            return None
+        meta = _load_json(meta_path, {})
+        have = {str(s).lower().strip("/") for s in meta.get("dataset_sources", [])}
+        return want.issubset(have)
+    except Exception:
+        return None
 
 
 def get_kernel_status(kernel_ref: str, api=None) -> Dict[str, Any]:
@@ -599,6 +1017,10 @@ def get_kernel_status(kernel_ref: str, api=None) -> Dict[str, Any]:
             failure_msg = getattr(result, "failure_message", None)
         # status may be an enum (e.g. KernelWorkerStatus.COMPLETE) or a string.
         status = str(getattr(raw_status, "name", raw_status)).split(".")[-1].lower()
+        if "cancel" in status:
+            status = "cancelled"
+        elif status in ("notstarted", "not_started"):
+            status = "queued"
         kernel_url = f"https://www.kaggle.com/code/{kernel_ref}"
         return {
             "status": status,
@@ -641,66 +1063,302 @@ def download_and_ingest_artifacts(
     target_run_dir = RUNS_DIR / target_exp_name
     target_run_dir.mkdir(parents=True, exist_ok=True)
 
-    temp_download_dir = KAGGLE_STAGING_DIR / "downloads" / target_exp_name
+    temp_download_dir = KAGGLE_STAGING_DIR / "downloads" / format_dataset_slug(target_exp_name)
     safe_rmtree(temp_download_dir)
     temp_download_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        api.kernels_output_cli(kernel_ref, path=str(temp_download_dir))
-
-        output_sub = temp_download_dir / "output"
-        source_dir = output_sub if output_sub.exists() and any(output_sub.iterdir()) else temp_download_dir
-
-        for item in source_dir.iterdir():
-            dest = target_run_dir / item.name
-            if item.is_dir():
-                shutil.copytree(item, dest, dirs_exist_ok=True)
-            else:
-                shutil.copy2(item, dest)
-
-        has_weights = (target_run_dir / "weights" / "best.pt").exists() or (target_run_dir / "best.pt").exists()
-        has_metrics = (target_run_dir / "results.csv").exists()
-
-        status_detail = []
-        if has_weights:
-            status_detail.append("🎯 Model Checkpoint (best.pt)")
-        if has_metrics:
-            status_detail.append("📊 Metrics (results.csv)")
-
-        msg = f"Artifacts successfully downloaded to {target_run_dir}!"
-        if status_detail:
-            msg += f" Found: {', '.join(status_detail)}."
-
-        return True, msg, target_run_dir
+        api.kernels_output(kernel_ref, path=str(temp_download_dir))
     except Exception as e:
-        return False, f"Failed to download kernel output: {str(e)}", None
+        return False, f"Failed to download kernel output: {e}", None
+
+    # The training script stages everything under 'output/'; fall back to the
+    # whole download tree if that folder is absent.
+    output_sub = temp_download_dir / "output"
+    source_dir = output_sub if (output_sub.exists() and any(output_sub.iterdir())) else temp_download_dir
+
+    copied = 0
+    for item in source_dir.iterdir():
+        if item.name.endswith(".log"):
+            continue
+        dest = target_run_dir / item.name
+        if item.is_dir():
+            shutil.copytree(item, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, dest)
+        copied += 1
+
+    weights = _find_weight_files(target_run_dir)
+    have = []
+    if weights.get("best.pt"):
+        have.append("best.pt")
+    if weights.get("last.pt"):
+        have.append("last.pt")
+    if (target_run_dir / "results.csv").exists():
+        have.append("results.csv")
+
+    if copied == 0:
+        return False, (
+            "Kernel produced no downloadable output yet. If it just finished, "
+            "wait a moment and retry; if it errored, check the log."
+        ), None
+
+    msg = f"Ingested {copied} item(s) into {target_run_dir}"
+    if have:
+        msg += f" — found {', '.join(have)}"
+    return True, msg, target_run_dir
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\[K|\[[0-9]+m")
+
+
+def _kernel_log_text(kernel_ref: str, api) -> Optional[str]:
+    """Best-effort download of a kernel's run log; returns plain text or None.
+
+    Kaggle usually only serves the log once the session ends, so this can return
+    None (or a stale/partial log) while a job is still running.
+    """
+    try:
+        dl_dir = KAGGLE_STAGING_DIR / "logs" / format_dataset_slug(kernel_ref)
+        safe_rmtree(dl_dir)
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        api.kernels_output(kernel_ref, path=str(dl_dir))
+    except Exception:
+        return None
+
+    log_file = None
+    for p in Path(dl_dir).rglob("*.log"):
+        log_file = p
+        break
+    if not log_file:
+        return None
+
+    raw = log_file.read_text(errors="replace")
+    # The log file is a JSON array of {stream_name, time, data} entries.
+    try:
+        entries = json.loads(raw)
+        raw = "".join(e.get("data", "") for e in entries)
+    except Exception:
+        pass
+    return _ANSI_RE.sub("", raw)
+
+
+def _parse_training_log(text: str) -> Dict[str, Any]:
+    """Pulls epoch / loss / mAP progress out of an Ultralytics training log."""
+    out: Dict[str, Any] = {
+        "epoch": None, "total_epochs": None, "pct": None,
+        "metrics": {}, "phase": None, "tail": "",
+    }
+    if not text:
+        return out
+
+    _noise = (
+        "nbconvert", "mistune.py", "SyntaxWarning", "invalid escape sequence",
+        "[NbConvertApp]", "filter_links.py", "re.sub(",
+    )
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    signal = [ln for ln in lines if not any(n in ln for n in _noise)]
+    out["tail"] = "\n".join((signal or lines)[-40:])
+
+    # Surface the actual exception message for failed runs.
+    err_line = next((ln.strip() for ln in reversed(lines)
+                     if re.search(r"(Error|Exception|assert|Traceback)", ln)
+                     and "re.sub(" not in ln), None)
+    if err_line:
+        out["error_line"] = err_line
+
+    # Epoch progress: lines like "   12/100   2.1G   1.23   2.34   1.11   42   640"
+    epoch_re = re.compile(r"^\s*(\d+)/(\d+)\s+[\d.]+G\b")
+    for ln in lines:
+        m = epoch_re.match(ln)
+        if m:
+            out["epoch"], out["total_epochs"] = int(m.group(1)), int(m.group(2))
+
+    # Validation summary: "  all   50   120   0.81   0.73   0.80   0.51"
+    val_re = re.compile(
+        r"^\s*all\s+\d+\s+\d+\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*$"
+    )
+    for ln in lines:
+        m = val_re.match(ln)
+        if m:
+            out["metrics"] = {
+                "precision": float(m.group(1)), "recall": float(m.group(2)),
+                "mAP50": float(m.group(3)), "mAP50_95": float(m.group(4)),
+            }
+
+    if out["epoch"] and out["total_epochs"]:
+        out["pct"] = round(100 * out["epoch"] / out["total_epochs"], 1)
+
+    low = text.lower()
+    if "training completed successfully" in low or "results saved to" in low or "epochs completed in" in low:
+        out["phase"] = "done"
+    elif "❌ training failed" in low or "traceback (most recent call last)" in low:
+        out["phase"] = "failed"
+    elif "starting training for" in low or out["epoch"]:
+        out["phase"] = "training"
+    elif "installing" in low or "collecting " in low or "initializing yolo" in low:
+        out["phase"] = "setup"
+    return out
+
+
+def get_training_progress(kernel_ref: str, api=None) -> Dict[str, Any]:
+    """Live-ish training progress for a kernel, parsed from its run log.
+
+    Returns {status, epoch, total_epochs, pct, metrics, phase, tail, log_available}.
+    log_available is False when Kaggle has not served any log yet (common while
+    a job is still running) - callers should fall back to status + elapsed.
+    """
+    if api is None:
+        api = get_kaggle_api()
+        if api is None:
+            return {"status": "error", "log_available": False,
+                    "message": "Kaggle API not authenticated."}
+
+    info = get_kernel_status(kernel_ref, api=api)
+    text = _kernel_log_text(kernel_ref, api)
+    parsed = _parse_training_log(text or "")
+    parsed["status"] = info.get("status", "unknown")
+    parsed["failureMessage"] = info.get("failureMessage")
+    parsed["url"] = info.get("url", f"https://www.kaggle.com/code/{kernel_ref}")
+    parsed["log_available"] = bool(text)
+    return parsed
+
+
+def _find_weight_files(root: Path) -> Dict[str, Path]:
+    """Locate best.pt / last.pt anywhere under a downloaded kernel-output tree."""
+    found: Dict[str, List[Path]] = {"best.pt": [], "last.pt": []}
+    for p in Path(root).rglob("*.pt"):
+        if p.name in found:
+            found[p.name].append(p)
+
+    def _pick(cands: List[Path]) -> Optional[Path]:
+        if not cands:
+            return None
+        # Prefer the copy the training script staged under output/ or the run dir.
+        for key in ("output", "train_output", "weights"):
+            for c in cands:
+                if key in c.parts:
+                    return c
+        return max(cands, key=lambda c: c.stat().st_size)
+
+    return {k: v for k, v in
+            {"best.pt": _pick(found["best.pt"]), "last.pt": _pick(found["last.pt"])}.items()
+            if v is not None}
+
+
+def download_weights(
+    kernel_ref: str,
+    dest_dir: Optional[Path] = None,
+    api=None,
+) -> Tuple[bool, str, Dict[str, Path]]:
+    """Downloads a finished kernel's output and extracts best.pt + last.pt.
+
+    Copies them into dest_dir (default: yolo_workspace/runs/<slug>/weights/) and
+    returns {name: local_path} so the UI can also offer direct downloads.
+    """
+    if api is None:
+        api = get_kaggle_api()
+        if api is None:
+            return False, "Kaggle API not authenticated.", {}
+
+    slug = format_dataset_slug(kernel_ref)
+    tmp_dir = KAGGLE_STAGING_DIR / "weights_dl" / slug
+    safe_rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        api.kernels_output(kernel_ref, path=str(tmp_dir))
+    except Exception as e:
+        return False, f"Could not download kernel output: {e}", {}
+
+    weights = _find_weight_files(tmp_dir)
+    if not weights:
+        return False, (
+            "No best.pt / last.pt found in the kernel output yet. "
+            "If the job is still running or just finished, try again shortly."
+        ), {}
+
+    if dest_dir is None:
+        dest_dir = RUNS_DIR / slug / "weights"
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: Dict[str, Path] = {}
+    for name, src in weights.items():
+        dst = dest_dir / name
+        shutil.copy2(src, dst)
+        saved[name] = dst
+
+    return True, f"Saved {', '.join(saved)} to {dest_dir}", saved
+
+
+def _elapsed_str(timestamp: str) -> str:
+    try:
+        started = time.mktime(time.strptime(timestamp, "%Y-%m-%d %H:%M:%S"))
+        secs = max(0, int(time.time() - started))
+    except Exception:
+        return "-"
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
+
+
+def _age_hours(timestamp: str) -> float:
+    try:
+        started = time.mktime(time.strptime(timestamp, "%Y-%m-%d %H:%M:%S"))
+        return max(0.0, (time.time() - started) / 3600.0)
+    except Exception:
+        return 1e9
+
+
+def list_all_jobs(api=None) -> List[Dict[str, Any]]:
+    """Local job history enriched with live Kaggle status, newest first.
+
+    Each item: history fields + {status, failureMessage, url, elapsed,
+    is_ongoing, is_stale}.
+    """
+    if api is None:
+        api = get_kaggle_api()
+
+    enriched: List[Dict[str, Any]] = []
+    for j in list_recent_jobs_history():
+        ref = j.get("kernel_ref")
+        item = dict(j)
+        info = get_kernel_status(ref, api=api) if (api and ref) else {"status": "unknown"}
+        status = info.get("status", "unknown")
+        age = _age_hours(j.get("timestamp", ""))
+        # 'unknown' == Kaggle's status endpoint 404s (no live session). Fresh ->
+        # probably still spinning up; old -> the session is gone, treat as done.
+        stale = status == "unknown" and age >= 6
+        item["status"] = status
+        item["failureMessage"] = info.get("failureMessage")
+        item["url"] = info.get("url", f"https://www.kaggle.com/code/{ref}")
+        item["elapsed"] = _elapsed_str(j.get("timestamp", ""))
+        item["is_stale"] = stale
+        item["is_ongoing"] = status in ("queued", "running") or (status == "unknown" and not stale)
+        enriched.append(item)
+    return enriched
 
 
 def list_recent_jobs_history() -> List[Dict[str, Any]]:
-    """Loads history of Kaggle training jobs from presets / local store."""
-    history_file = WORKSPACE_DIR / "kaggle_jobs.json"
-    if not history_file.exists():
-        return []
-    try:
-        with open(history_file, "r") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    """Loads history of Kaggle training jobs from the local store, newest first."""
+    jobs = _load_json(JOBS_HISTORY_FILE, [])
+    return jobs if isinstance(jobs, list) else []
 
 
 def save_job_to_history(job_info: Dict[str, Any]):
-    """Appends or updates a job in local history."""
-    history_file = WORKSPACE_DIR / "kaggle_jobs.json"
+    """Appends or updates a job (keyed by kernel_ref) in local history."""
     jobs = list_recent_jobs_history()
-    updated = False
     for i, j in enumerate(jobs):
         if j.get("kernel_ref") == job_info.get("kernel_ref"):
-            jobs[i] = job_info
-            updated = True
+            jobs[i] = {**j, **job_info}
             break
-    if not updated:
+    else:
         jobs.insert(0, job_info)
+    _save_json(JOBS_HISTORY_FILE, jobs[:25])
 
-    history_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(history_file, "w") as f:
-        json.dump(jobs[:25], f, indent=2)
+
+def delete_job_from_history(kernel_ref: str):
+    """Removes a job from local history (does not touch the kernel on Kaggle)."""
+    jobs = [j for j in list_recent_jobs_history() if j.get("kernel_ref") != kernel_ref]
+    _save_json(JOBS_HISTORY_FILE, jobs)
