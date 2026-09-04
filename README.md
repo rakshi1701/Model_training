@@ -53,16 +53,23 @@ A comprehensive Streamlit workspace for managing the entire lifecycle of YOLO co
 
 > **Note on the quota tracker:** Kaggle publishes no quota API. The figure is estimated from jobs dispatched by this dashboard — runs you start on kaggle.com are not counted. Confirm at [kaggle.com/settings](https://www.kaggle.com/settings).
 
-**Job dashboard** — tracked runs are grouped into four sections, each with its own actions:
+**Job dashboard** — a status-count row, then one scannable table of every job (status, model, epochs, when, runtime, whether weights are downloaded, and where the job came from), with filter and search above it. Selecting a row opens its details, logs, GPU telemetry and downloads underneath.
 
-| Section | Meaning | Model download |
+Jobs are listed from **both** local history and your Kaggle account, so runs dispatched from another machine — or before this dashboard tracked them — still appear, marked `Source: Kaggle`.
+
+| Status | Meaning | Model download |
 | :--- | :--- | :--- |
-| 🟢 **Ongoing** | Running or queued on Kaggle | — (offers **Stop this job**) |
-| 🎉 **Successful** | Finished cleanly | ✅ `best.pt` / `last.pt`, with full-run ingest tucked behind an expander |
-| 🚫 **Cancelled / Terminated** | Stopped from the console, cut short by the runtime cap, or ended without reporting completion | Partial `last.pt` only, labelled as such (useful to seed a resume) |
+| 🟢 **Running** | Training on Kaggle now | — (offers **Stop this job**) |
+| ⏳ **Pending** | Queued or still starting up | — |
+| 🎉 **Completed** | Finished cleanly | ✅ `best.pt` / `last.pt`, plus full-run ingest |
+| ⏹ **Terminated** | Cut short by the runtime cap | Partial `last.pt`, labelled as such |
+| 🚫 **Cancelled** | Stopped from the Kaggle console | Partial `last.pt`, labelled as such |
 | ❌ **Failed** | Errored before producing a model | — (log only) |
+| ❔ **Unknown** | Session ended, outcome not read yet | — (offers **Check outcome**) |
 
-Downloads in the dashboard are **model weights only** (`.pt`). Metrics, curves and plots come through **Ingest full run**, which places them in `yolo_workspace/runs/` for Inference, Export Studio and Run History.
+Downloads are **model weights only** (`.pt`). Metrics, curves and plots come through **Ingest full run**, which places them in `yolo_workspace/runs/` for Inference, Export Studio and Run History.
+
+> **How a finished run's status is determined:** Kaggle's status endpoint 404s once a session ends, which says nothing about how the run went. The outcome therefore comes from the run log's own verdict (cached after the first read) or from artifacts already ingested locally — never from the 404. **🔎 Check outcome** reads the log for a job still showing ❔ Unknown.
 
 > **Stopping a cloud job:** Kaggle's public API has **no cancel endpoint** ([kaggle-api#388](https://github.com/Kaggle/kaggle-api/issues/388)), and there is no direct URL for the Active Events panel, so **🛑 Stop this job** shows the exact click path: any Kaggle page → left sidebar **⧉ View Active Events** → **⋯** next to the session → **⏹ Stop Session**. The kernel page's Run/Save controls do *not* stop a running batch job. **🗑 Remove from this list** is local tracking only and warns before orphaning a job that is still running. Once stopped, the dashboard picks up the cancelled status on the next refresh.
 

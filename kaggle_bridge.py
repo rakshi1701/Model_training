@@ -1538,17 +1538,35 @@ def _age_hours(timestamp: str) -> float:
         return 1e9
 
 
-def list_all_jobs(api=None) -> List[Dict[str, Any]]:
-    """Local job history enriched with live Kaggle status, newest first.
+def _local_model_for(job: Dict[str, Any]) -> Optional[Path]:
+    """The ingested best.pt for a job, if one is already on disk."""
+    exp = job.get("target_exp")
+    if not exp:
+        return None
+    for cand in (RUNS_DIR / exp / "weights" / "best.pt", RUNS_DIR / exp / "best.pt"):
+        if cand.exists():
+            return cand
+    return None
+
+
+def list_all_jobs(api=None, include_discovered: bool = True) -> List[Dict[str, Any]]:
+    """Every known training job, enriched with live Kaggle status, newest first.
+
+    Combines locally dispatched jobs with training kernels discovered on the
+    Kaggle account, so runs launched elsewhere still show up.
 
     Each item: history fields + {status, failureMessage, url, elapsed,
-    is_ongoing, is_stale}.
+    is_ongoing, is_stale, category, status_label, has_local_model}.
     """
     if api is None:
         api = get_kaggle_api()
 
+    records = list_recent_jobs_history()
+    if include_discovered and api is not None:
+        records = records + discover_account_jobs(api=api)
+
     enriched: List[Dict[str, Any]] = []
-    for j in list_recent_jobs_history():
+    for j in records:
         ref = j.get("kernel_ref")
         item = dict(j)
         info = get_kernel_status(ref, api=api) if (api and ref) else {"status": "unknown"}
@@ -1567,7 +1585,14 @@ def list_all_jobs(api=None) -> List[Dict[str, Any]]:
         item["ingested"] = bool(j.get("ingested"))
         item["resumable"] = bool(j.get("resumable"))
         item["remote_state"] = j.get("remote_state")
+        local_model = _local_model_for(j)
+        item["has_local_model"] = local_model is not None
+        item["local_model_path"] = str(local_model) if local_model else None
+        item["category"] = classify_job(item)
+        item["status_label"] = job_status_label(item)
         enriched.append(item)
+
+    enriched.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     return enriched
 
 
@@ -1708,37 +1733,150 @@ def auto_ingest_completed_jobs(api=None) -> List[Dict[str, Any]]:
     return results
 
 
-#: Buckets the dashboard groups jobs into, in display order.
-JOB_CATEGORIES = ("ongoing", "successful", "cancelled", "failed")
+#: Buckets the dashboard groups jobs into, in display order, with the label and
+#: icon the UI shows for each.
+JOB_CATEGORIES = ("running", "pending", "successful", "terminated", "cancelled",
+                  "failed", "unresolved")
+
+CATEGORY_LABELS = {
+    "running":    ("🟢", "Running"),
+    "pending":    ("⏳", "Pending"),
+    "successful": ("🎉", "Completed"),
+    "terminated": ("⏹", "Terminated"),
+    "cancelled":  ("🚫", "Cancelled"),
+    "failed":     ("❌", "Failed"),
+    "unresolved": ("❔", "Unknown"),
+}
 
 
 def classify_job(job: Dict[str, Any]) -> str:
     """Sorts an enriched job into one of JOB_CATEGORIES.
 
-    'cancelled' covers both a stop requested on kaggle.com and a run that was
-    terminated without finishing - a session that expired, or one truncated by
-    the runtime cap. 'successful' means Kaggle reported completion, which is the
-    only case that should be offering a trained model for download.
+    Live status is authoritative while a session exists. Once it ends Kaggle's
+    status endpoint 404s, so the outcome comes from the run log's own verdict
+    (cached as remote_state) or from artifacts already ingested locally - not
+    from the 404, which says nothing about how the run went.
     """
-    if job.get("is_ongoing"):
-        return "ongoing"
     status = job.get("status")
-    if status == "cancelled" or job.get("remote_state") == "timecapped" or job.get("is_stale"):
+    if status == "running":
+        return "running"
+    if status == "queued":
+        return "pending"
+    if status == "cancelled":
         return "cancelled"
+
+    # The remote script's own verdict, recorded when the log was last read.
+    remote = job.get("remote_state")
+    if remote == "ok":
+        return "successful"
+    if remote == "timecapped":
+        return "terminated"
+    if remote == "failed":
+        return "failed"
+
     if status == "complete":
         return "successful"
-    return "failed"
+    if status == "error":
+        return "failed"
+
+    # status == "unknown": no live session. Fresh means it is still spinning up;
+    # otherwise the run ended and we cannot yet say how.
+    if not job.get("is_stale"):
+        return "pending"
+    if job.get("ingested") or job.get("has_local_model"):
+        return "successful"
+    return "unresolved"
+
+
+def job_status_label(job: Dict[str, Any]) -> str:
+    """'🎉 Completed' style label for the category a job falls into."""
+    icon, name = CATEGORY_LABELS[classify_job(job)]
+    return f"{icon} {name}"
 
 
 def job_termination_reason(job: Dict[str, Any]) -> str:
-    """Human-readable why for a job in the cancelled/terminated bucket."""
-    if job.get("status") == "cancelled":
+    """Human-readable why for a job that did not complete normally."""
+    cat = classify_job(job)
+    if cat == "cancelled":
         return "Stopped from the Kaggle console"
-    if job.get("remote_state") == "timecapped":
-        return "Terminated by the runtime cap before all epochs finished"
-    if job.get("is_stale"):
-        return "Session ended without reporting completion (expired or terminated by Kaggle)"
-    return "Terminated"
+    if cat == "terminated":
+        return "Cut short by the runtime cap before all epochs finished"
+    if cat == "unresolved":
+        return ("Session has ended, but its outcome has not been read yet — "
+                "use “Check outcome” to read the run log")
+    if cat == "failed":
+        return "Errored on Kaggle before producing a model"
+    return ""
+
+
+def resolve_job_outcome(kernel_ref: str, api=None) -> Dict[str, Any]:
+    """Reads a finished kernel's log to settle how it actually ended.
+
+    Kaggle's status endpoint forgets a run once its session is gone, so this is
+    the only way to tell a completed run from a crashed one after the fact. The
+    verdict is cached in job history so it is read at most once per job.
+    """
+    progress = get_training_progress(kernel_ref, api=api)
+    state = progress.get("remote_state")
+    if not state:
+        # Older jobs predate the [YS-SUMMARY] marker; fall back to the phase the
+        # log parser inferred from Ultralytics' own output.
+        phase = progress.get("phase")
+        state = {"done": "ok", "failed": "failed", "timecapped": "timecapped"}.get(phase)
+
+    patch: Dict[str, Any] = {"kernel_ref": kernel_ref}
+    if state:
+        patch["remote_state"] = state
+    if progress.get("log_available"):
+        patch["outcome_checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if len(patch) > 1:
+        save_job_to_history(patch)
+        record_job_runtime(kernel_ref, progress)
+    return progress
+
+
+#: Kernels this dashboard could plausibly have produced. Used to keep unrelated
+#: notebooks on the account out of the training job list.
+_TRAINING_KERNEL_HINTS = ("yolo", "train", "cctv", "detect", "segment")
+
+
+def discover_account_jobs(api=None, page_size: int = 100) -> List[Dict[str, Any]]:
+    """Training kernels that exist on the Kaggle account but are not tracked locally.
+
+    The local history only knows about jobs dispatched from this machine, so a
+    run launched elsewhere (or before tracking existed) would otherwise never
+    appear in the dashboard.
+    """
+    if api is None:
+        api = get_kaggle_api()
+        if api is None:
+            return []
+
+    known = {j.get("kernel_ref", "").lower() for j in list_recent_jobs_history()}
+    found: List[Dict[str, Any]] = []
+    try:
+        kernels = api.kernels_list(mine=True, page_size=page_size, sort_by="dateRun")
+    except Exception:
+        return []
+
+    for k in kernels:
+        ref = str(getattr(k, "ref", "") or "").strip("/")
+        if not ref or ref.lower() in known:
+            continue
+        slug = ref.split("/")[-1].lower()
+        if not any(h in slug for h in _TRAINING_KERNEL_HINTS):
+            continue
+        last_run = getattr(k, "last_run_time", None)
+        found.append({
+            "kernel_ref": ref,
+            "timestamp": last_run.strftime("%Y-%m-%d %H:%M:%S") if last_run else "",
+            "model_name": "?",
+            "epochs": "?",
+            "dataset_ref": "?",
+            "title": str(getattr(k, "title", "") or slug),
+            "discovered": True,
+        })
+    return found
 
 
 def kernel_session_url(kernel_ref: str) -> str:
