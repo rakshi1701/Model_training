@@ -851,16 +851,33 @@ print("🏋️ Starting Training: Model={model_name} | Epochs={epochs} | Batch={
 print(f"⏳ Wall-clock cap: {max_hours}h (Kaggle terminates sessions at 12h)")
 print("=" * 60)
 
+# Runtime cap as a stop-callback, NOT Ultralytics' `time=` argument.
+# `time=` means "train FOR this long": trainer.py recomputes
+#   self.epochs = ceil(time * 3600 / mean_epoch_time)
+# every epoch, which silently overrides the requested epoch count (a 6-epoch
+# job became ~1180). This callback leaves `epochs` authoritative and only
+# truncates a run that would otherwise overrun Kaggle's 12h session limit.
+hit_time_cap = False
+
+
+def _cap_runtime(trainer):
+    global hit_time_cap
+    if (_time.time() - JOB_T0) > MAX_SECONDS:
+        hit_time_cap = True
+        trainer.stop = True
+        print(f"⏳ Runtime cap of {max_hours}h reached — stopping after this epoch "
+              f"so artifacts are packaged before Kaggle ends the session.", flush=True)
+
+
 def _run_training(dev):
     if resume_ckpt is not None:
-        # On resume Ultralytics reads epochs/optimizer/data from the checkpoint;
-        # only the runtime budget is re-applied.
-        return YOLO(str(resume_ckpt)).train(
-            resume=True,
-            device=dev,
-            time={max_hours},
-        )
-    return YOLO("{model_name}").train(
+        # On resume Ultralytics reads epochs/optimizer/data from the checkpoint.
+        model = YOLO(str(resume_ckpt))
+        model.add_callback("on_fit_epoch_end", _cap_runtime)
+        return model.train(resume=True, device=dev)
+    model = YOLO("{model_name}")
+    model.add_callback("on_fit_epoch_end", _cap_runtime)
+    return model.train(
         data=str(patched_yaml),
         epochs={epochs},
         batch={batch_size},
@@ -875,8 +892,14 @@ def _run_training(dev):
         plots=True,
         save=True,
         verbose=True,
-        time={max_hours},
     )
+
+
+if isinstance(devices, list):
+    # Ultralytics reconstructs the trainer from args alone inside DDP
+    # subprocesses, so custom callbacks do not reach them.
+    print("ℹ️ DDP mode: the runtime cap is best-effort — set epochs so the run "
+          "comfortably fits inside Kaggle's 12h session limit.")
 
 train_ok = False
 try:
@@ -926,10 +949,9 @@ print(f"✅ Staged {{len(found)}} files in /kaggle/working/output/: {{found[:20]
 
 # 5. Completion summary the local dashboard parses out of the log.
 elapsed_h = (_time.time() - JOB_T0) / 3600.0
-hit_cap = elapsed_h >= (MAX_SECONDS / 3600.0) * 0.97
 has_last = (output_archive_dir / "last.pt").exists()
 state = "ok" if train_ok else "failed"
-if train_ok and hit_cap:
+if train_ok and hit_time_cap:
     state = "timecapped"
 print(f"[YS-SUMMARY] state={{state}} elapsed_hours={{elapsed_h:.3f}} resumable={{int(has_last)}}")
 if state == "timecapped":

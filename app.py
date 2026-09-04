@@ -1443,6 +1443,9 @@ with tab_kaggle:
             st.info("Kaggle only serves the run log once the session ends, so epoch detail and "
                     "GPU telemetry appear after the job finishes. The status badge above is live.")
 
+    def _ongoing_job(j):
+        return bool(j.get("is_ongoing"))
+
     def _render_job(j, open_default):
         ref = j["kernel_ref"]
         status = j["status"]
@@ -1457,11 +1460,18 @@ with tab_kaggle:
         _nparts = j.get("dataset_parts", 1)
         _ds_disp = f"{_dsr} ({_nparts} parts)" if _nparts and _nparts > 1 else _dsr
         with st.expander(head, expanded=open_default):
-            _gpu_h = f" · 🔋 {j['gpu_hours']:.2f} GPU-h" if j.get("gpu_hours") else ""
+            # For a live job, time since dispatch is the useful number; for a
+            # finished one it is just its age, so show measured runtime instead.
+            if _ongoing_job(j):
+                _timing = f"⏱ running {j.get('elapsed', '-')}"
+            elif j.get("gpu_hours"):
+                _timing = f"⏱ ran {kaggle_bridge._duration_str(j['gpu_hours'] * 3600)}"
+            else:
+                _timing = f"🗓 dispatched {j.get('elapsed', '-')} ago"
             st.markdown(
                 f"[🔗 Open in Kaggle Console]({j['url']})  |  "
                 f"Model `{j.get('model_name','?')}` · {j.get('epochs','?')} epochs · "
-                f"dataset `{_ds_disp}` · ⏱ {j.get('elapsed','-')}{_gpu_h}"
+                f"dataset `{_ds_disp}` · {_timing}"
             )
             if j.get("resumed_from"):
                 st.caption(f"♻️ Continues `{j['resumed_from']}`")
@@ -1533,7 +1543,7 @@ with tab_kaggle:
             # Stopping a run is a Kaggle-side action: the public API has no
             # cancel endpoint, so removing it locally would leave it running and
             # burning GPU quota with nothing tracking it.
-            _ongoing = j.get("is_ongoing")
+            _ongoing = _ongoing_job(j)
             act1, act2 = st.columns(2)
             with act1:
                 if _ongoing and st.button("🛑 Stop this job", key=f"stop_{ref}",
