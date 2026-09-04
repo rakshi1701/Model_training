@@ -1237,6 +1237,8 @@ def download_and_ingest_artifacts(
             "wait a moment and retry; if it errored, check the log."
         ), None
 
+    set_run_dir_owner(target_run_dir, kernel_ref)
+
     msg = f"Ingested {copied} item(s) into {target_run_dir}"
     if have:
         msg += f" — found {', '.join(have)}"
@@ -1538,15 +1540,86 @@ def _age_hours(timestamp: str) -> float:
         return 1e9
 
 
-def _local_model_for(job: Dict[str, Any]) -> Optional[Path]:
-    """The ingested best.pt for a job, if one is already on disk."""
-    exp = job.get("target_exp")
-    if not exp:
+#: Marker written into a run folder naming the kernel whose output filled it.
+RUN_OWNER_FILE = ".kaggle_job.json"
+
+
+def run_dir_owner(run_dir: Path) -> Optional[str]:
+    """Which kernel's output populated this run folder, if recorded.
+
+    Several jobs can point at the same target_exp, so a folder holding a
+    best.pt proves nothing about which job produced it. Only this marker does.
+    """
+    marker = Path(run_dir) / RUN_OWNER_FILE
+    if not marker.exists():
         return None
-    for cand in (RUNS_DIR / exp / "weights" / "best.pt", RUNS_DIR / exp / "best.pt"):
-        if cand.exists():
-            return cand
-    return None
+    try:
+        return str(json.loads(marker.read_text()).get("kernel_ref", "")).strip("/") or None
+    except Exception:
+        return None
+
+
+def set_run_dir_owner(run_dir: Path, kernel_ref: str):
+    """Records which kernel's output was ingested into a run folder."""
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _save_json(run_dir / RUN_OWNER_FILE, {
+        "kernel_ref": kernel_ref.strip("/"),
+        "ingested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+
+def job_weights_dir(job: Dict[str, Any]) -> Path:
+    """Where this job's fetched .pt files live locally.
+
+    Always keyed on the kernel slug, never on target_exp: several jobs can share
+    a target_exp (it defaults to the same value in the dispatcher form), and
+    keying on it would show one job's weights under another job's card.
+    """
+    slug = format_dataset_slug(str(job.get("kernel_ref", "kaggle-job")).split("/")[-1])
+    return RUNS_DIR / "kaggle_models" / slug
+
+
+def local_weights_for(job: Dict[str, Any]) -> Dict[str, Path]:
+    """Any .pt files already downloaded for a job, as {name: path}.
+
+    Keying the download UI off files on disk rather than session state means a
+    fetched model stays downloadable across reruns. The target_exp folder only
+    counts when this job is the one recorded as ingested there, so a job never
+    borrows another run's weights.
+    """
+    roots = [job_weights_dir(job)]
+    exp = job.get("target_exp")
+    if exp and run_dir_owner(RUNS_DIR / exp) == str(job.get("kernel_ref", "")).strip("/"):
+        roots += [RUNS_DIR / exp / "weights", RUNS_DIR / exp]
+
+    found: Dict[str, Path] = {}
+    for root in roots:
+        for name in ("best.pt", "last.pt"):
+            cand = root / name
+            if cand.exists() and name not in found:
+                found[name] = cand
+    return found
+
+
+def next_free_run_name(prefix: str = "kaggle_exp") -> str:
+    """First unused yolo_workspace/runs/<prefix>N, so runs never overwrite.
+
+    The dispatcher form previously defaulted to a fixed name, which meant a
+    second cloud run ingested straight over the first one's results.
+    """
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    taken = {p.name for p in RUNS_DIR.iterdir() if p.is_dir()} if RUNS_DIR.exists() else set()
+    taken |= {j.get("target_exp") for j in list_recent_jobs_history() if j.get("target_exp")}
+    n = 1
+    while f"{prefix}{n}" in taken:
+        n += 1
+    return f"{prefix}{n}"
+
+
+def _local_model_for(job: Dict[str, Any]) -> Optional[Path]:
+    """The best.pt for a job, if one is already on disk."""
+    return local_weights_for(job).get("best.pt")
 
 
 def list_all_jobs(api=None, include_discovered: bool = True) -> List[Dict[str, Any]]:
@@ -1716,7 +1789,7 @@ def auto_ingest_completed_jobs(api=None) -> List[Dict[str, Any]]:
         # record it and skip the re-download rather than re-pulling every run
         # the first time polling is switched on.
         dest = RUNS_DIR / exp_name
-        if (dest / "weights" / "best.pt").exists() or (dest / "best.pt").exists():
+        if run_dir_owner(dest) == ref.strip("/"):
             save_job_to_history({"kernel_ref": ref, "ingested": True, "target_exp": exp_name})
             continue
 

@@ -53,7 +53,7 @@ A comprehensive Streamlit workspace for managing the entire lifecycle of YOLO co
 
 > **Note on the quota tracker:** Kaggle publishes no quota API. The figure is estimated from jobs dispatched by this dashboard — runs you start on kaggle.com are not counted. Confirm at [kaggle.com/settings](https://www.kaggle.com/settings).
 
-**Job dashboard** — a status-count row, then one scannable table of every job (status, model, epochs, when, runtime, whether weights are downloaded, and where the job came from), with filter and search above it. Selecting a row opens its details, logs, GPU telemetry and downloads underneath.
+**Job dashboard** — a status-count row, a filter and search bar, then one vertical card per job. Each card is self-contained: status badge, model / epochs / dataset / runtime, model downloads, actions, and an expandable log + GPU telemetry panel. Nothing depends on a row selection, so clicking an action never collapses what you were looking at.
 
 Jobs are listed from **both** local history and your Kaggle account, so runs dispatched from another machine — or before this dashboard tracked them — still appear, marked `Source: Kaggle`.
 
@@ -68,6 +68,8 @@ Jobs are listed from **both** local history and your Kaggle account, so runs dis
 | ❔ **Unknown** | Session ended, outcome not read yet | — (offers **Check outcome**) |
 
 Downloads are **model weights only** (`.pt`). Metrics, curves and plots come through **Ingest full run**, which places them in `yolo_workspace/runs/` for Inference, Export Studio and Run History.
+
+Fetched weights land in `yolo_workspace/runs/kaggle_models/<kernel-slug>/`, one folder per job, and the download buttons are driven by what is on disk — so a model stays downloadable across reruns. **Local Target Run Name** auto-increments (`kaggle_exp1`, `kaggle_exp2`, …) so a new cloud run never ingests over a previous one's results, and each run folder records which kernel filled it.
 
 > **How a finished run's status is determined:** Kaggle's status endpoint 404s once a session ends, which says nothing about how the run went. The outcome therefore comes from the run log's own verdict (cached after the first read) or from artifacts already ingested locally — never from the 404. **🔎 Check outcome** reads the log for a job still showing ❔ Unknown.
 
