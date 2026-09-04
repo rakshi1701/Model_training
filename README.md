@@ -53,6 +53,8 @@ A comprehensive Streamlit workspace for managing the entire lifecycle of YOLO co
 
 > **Note on the quota tracker:** Kaggle publishes no quota API. The figure is estimated from jobs dispatched by this dashboard — runs you start on kaggle.com are not counted. Confirm at [kaggle.com/settings](https://www.kaggle.com/settings).
 
+> **Stopping a cloud job:** Kaggle's public API has **no cancel endpoint** ([kaggle-api#388](https://github.com/Kaggle/kaggle-api/issues/388)), so a running kernel can only be stopped from the Kaggle web console. **🛑 Stop this job** checks live status and links straight to the session page — use **Stop Session** there. **🗑 Remove from this list** is local tracking only and warns before orphaning a job that is still running. Once you stop it on Kaggle, the dashboard picks up the cancelled status on the next refresh.
+
 ### 6. 📊 Run History & Comparisons
 - Automatically tracks all training experiments in `yolo_workspace/runs/`.
 - Multi-run overlay comparison charts for mAP50, mAP50-95, and loss curves across experiments.

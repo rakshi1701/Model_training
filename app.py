@@ -1530,10 +1530,38 @@ with tab_kaggle:
                 if st.session_state.get(f"prog_{ref}"):
                     _render_progress(st.session_state[f"prog_{ref}"])
 
-            if st.button("🗑 Remove from this list", key=f"del_{ref}"):
-                kaggle_bridge.delete_job_from_history(ref)
-                st.session_state.jobs_nonce += 1
-                st.rerun()
+            # Stopping a run is a Kaggle-side action: the public API has no
+            # cancel endpoint, so removing it locally would leave it running and
+            # burning GPU quota with nothing tracking it.
+            _ongoing = j.get("is_ongoing")
+            act1, act2 = st.columns(2)
+            with act1:
+                if _ongoing and st.button("🛑 Stop this job", key=f"stop_{ref}",
+                                          use_container_width=True):
+                    with st.spinner("Checking live status on Kaggle..."):
+                        stopped, stop_msg, stop_url = kaggle_bridge.request_kernel_stop(ref)
+                    if stopped:
+                        st.success(stop_msg)
+                        st.session_state.jobs_nonce += 1
+                    else:
+                        st.warning(stop_msg)
+                        st.markdown(f"➡️ **[Open the session page to stop it]({stop_url})**")
+            with act2:
+                if st.button("🗑 Remove from this list", key=f"del_{ref}",
+                             use_container_width=True):
+                    if _ongoing and not st.session_state.get(f"confirm_del_{ref}"):
+                        st.session_state[f"confirm_del_{ref}"] = True
+                        st.warning(
+                            "This job still looks active on Kaggle. Removing it here only "
+                            "stops *tracking* it — the kernel keeps running and keeps using "
+                            "your GPU quota. Stop it on Kaggle first, or press again to "
+                            "remove it anyway."
+                        )
+                    else:
+                        kaggle_bridge.delete_job_from_history(ref)
+                        st.session_state.pop(f"confirm_del_{ref}", None)
+                        st.session_state.jobs_nonce += 1
+                        st.rerun()
 
     @st.fragment(run_every=30 if st.session_state.get("k_live_poll") else None)
     def _jobs_dashboard():
@@ -1557,6 +1585,11 @@ with tab_kaggle:
         finished = [j for j in all_jobs if not j.get("is_ongoing")]
         if ongoing:
             st.markdown(f"**Ongoing — {len(ongoing)}**")
+            st.caption(
+                "⚠️ Kaggle's public API has no cancel endpoint, so a running job can only be "
+                "stopped from the Kaggle web console — use **🛑 Stop this job** for the direct "
+                "link. Removing a job from this list does not stop it."
+            )
             for j in ongoing:
                 _render_job(j, open_default=True)
         if finished:

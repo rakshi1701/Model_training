@@ -1686,7 +1686,51 @@ def auto_ingest_completed_jobs(api=None) -> List[Dict[str, Any]]:
     return results
 
 
+def kernel_session_url(kernel_ref: str) -> str:
+    """Direct link to a kernel's session page, where Kaggle's Stop button lives."""
+    return f"https://www.kaggle.com/code/{kernel_ref.strip('/')}"
+
+
+def request_kernel_stop(kernel_ref: str, api=None) -> Tuple[bool, str, str]:
+    """Attempts to stop a running kernel; reports honestly when it cannot.
+
+    Kaggle's backend supports cancellation (KernelWorkerStatus has
+    CANCEL_REQUESTED / CANCEL_ACKNOWLEDGED) but the public API exposes no RPC
+    for it - see https://github.com/Kaggle/kaggle-api/issues/388. Only the web
+    UI can trigger a stop, so this reports live status and hands back the URL
+    to do it, rather than pretending the job was cancelled.
+
+    Returns: (already_stopped, message, session_url)
+    """
+    url = kernel_session_url(kernel_ref)
+    if api is None:
+        api = get_kaggle_api()
+
+    info = get_kernel_status(kernel_ref, api=api) if api else {"status": "unknown"}
+    status = info.get("status", "unknown")
+
+    if status in ("complete", "error", "cancelled"):
+        return True, f"Job is already finished on Kaggle (status: {status}). Nothing to stop.", url
+    if status == "unknown":
+        return False, (
+            "Kaggle's status endpoint has no live session for this kernel, which usually "
+            "means it already ended. If it is still shown as running on Kaggle, stop it "
+            "from the session page."
+        ), url
+    return False, (
+        f"This job is {status.upper()} on Kaggle and is still consuming your GPU quota. "
+        "Kaggle's public API has no cancel endpoint, so it must be stopped from the web "
+        "console: open the session page and use **Stop Session** (the ⏹ control on the "
+        "run). The dashboard will pick up the cancelled status on the next refresh."
+    ), url
+
+
 def delete_job_from_history(kernel_ref: str):
-    """Removes a job from local history (does not touch the kernel on Kaggle)."""
+    """Removes a job from local history.
+
+    Local-only: this does NOT stop the kernel on Kaggle. Callers must warn the
+    user when the job is still running, or it silently leaves a job burning GPU
+    quota with nothing tracking it.
+    """
     jobs = [j for j in list_recent_jobs_history() if j.get("kernel_ref") != kernel_ref]
     _save_json(JOBS_HISTORY_FILE, jobs)
