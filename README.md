@@ -43,7 +43,15 @@ A comprehensive Streamlit workspace for managing the entire lifecycle of YOLO co
 - **Free Multi-GPU Acceleration**: Offload long training jobs to Kaggle's Dual NVIDIA Tesla T4 (32GB VRAM) or P100 GPUs via PyTorch Distributed Data Parallel (DDP).
 - **1-Click Remote Dispatch**: Seamlessly packages datasets, pushes training kernels via Kaggle API, and tracks live execution status from within the dashboard.
 - **Automated Checkpoint Sync**: Automatically downloads `best.pt`, `results.csv`, and validation figures into `yolo_workspace/runs/` for immediate local inference and evaluation.
+- **Live Polling & Auto-Ingest**: Toggle **Live polling** to re-check every tracked job every 30s and pull finished runs into `yolo_workspace/runs/` with no clicks. Runs already on disk are never re-downloaded.
+- **Remote GPU Telemetry**: The generated kernel samples `nvidia-smi` every 30s and emits `[GPUSTAT]` markers, so the dashboard shows per-GPU utilisation, VRAM, temperature, power, a utilisation-over-time chart, and epoch ETA parsed from the run log.
+- **Weekly GPU Quota Tracker**: Rolling 7-day estimate of GPU hours used vs. Kaggle's 30h/week allowance, measured from each job's actual runtime.
+- **12-Hour Timeout Survival**: A configurable wall-clock cap (default 11h) stops training before Kaggle kills the session and always packages `last.pt`. Pick a capped or crashed job under **Resume from previous job** to mount its output and continue from that checkpoint.
+- **Crash-Safe Artifacts**: A failed run still packages whatever was checkpointed, so partial weights survive an OOM or a mid-run error.
+- **Post-Training Pipeline**: Optionally auto-export the ingested `best.pt` to ONNX / TorchScript / OpenVINO as soon as a cloud run lands.
 - **Standalone Jupyter Template**: Includes a pre-configured `kaggle_yolo_train_template.ipynb` for direct web notebook training.
+
+> **Note on the quota tracker:** Kaggle publishes no quota API. The figure is estimated from jobs dispatched by this dashboard — runs you start on kaggle.com are not counted. Confirm at [kaggle.com/settings](https://www.kaggle.com/settings).
 
 ### 6. 📊 Run History & Comparisons
 - Automatically tracks all training experiments in `yolo_workspace/runs/`.
