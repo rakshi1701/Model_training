@@ -1708,6 +1708,39 @@ def auto_ingest_completed_jobs(api=None) -> List[Dict[str, Any]]:
     return results
 
 
+#: Buckets the dashboard groups jobs into, in display order.
+JOB_CATEGORIES = ("ongoing", "successful", "cancelled", "failed")
+
+
+def classify_job(job: Dict[str, Any]) -> str:
+    """Sorts an enriched job into one of JOB_CATEGORIES.
+
+    'cancelled' covers both a stop requested on kaggle.com and a run that was
+    terminated without finishing - a session that expired, or one truncated by
+    the runtime cap. 'successful' means Kaggle reported completion, which is the
+    only case that should be offering a trained model for download.
+    """
+    if job.get("is_ongoing"):
+        return "ongoing"
+    status = job.get("status")
+    if status == "cancelled" or job.get("remote_state") == "timecapped" or job.get("is_stale"):
+        return "cancelled"
+    if status == "complete":
+        return "successful"
+    return "failed"
+
+
+def job_termination_reason(job: Dict[str, Any]) -> str:
+    """Human-readable why for a job in the cancelled/terminated bucket."""
+    if job.get("status") == "cancelled":
+        return "Stopped from the Kaggle console"
+    if job.get("remote_state") == "timecapped":
+        return "Terminated by the runtime cap before all epochs finished"
+    if job.get("is_stale"):
+        return "Session ended without reporting completion (expired or terminated by Kaggle)"
+    return "Terminated"
+
+
 def kernel_session_url(kernel_ref: str) -> str:
     """Direct link to a kernel's session page, where Kaggle's Stop button lives."""
     return f"https://www.kaggle.com/code/{kernel_ref.strip('/')}"

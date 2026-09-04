@@ -1384,6 +1384,27 @@ with tab_kaggle:
         "complete": "🎉 COMPLETE", "error": "❌ ERROR", "cancelled": "🚫 CANCELLED",
     }
 
+    # Kaggle has no cancel API and no direct URL for the Active Events panel,
+    # so spell out the click path instead of only linking the kernel page.
+    _STOP_STEPS = (
+        "**To stop it on Kaggle:**\n"
+        "1. Open [kaggle.com]({url}) — or any Kaggle page.\n"
+        "2. In the left sidebar click **⧉ View Active Events**.\n"
+        "3. Find this session, click the **⋯** next to it, then **⏹ Stop Session**.\n\n"
+        "The kernel page's Run/Save controls do *not* stop a running batch job — "
+        "Active Events is the only place with the stop control."
+    )
+
+    _SECTIONS = {
+        "ongoing":    ("🟢 Ongoing", "Running or queued on Kaggle right now."),
+        "successful": ("🎉 Successful — trained models",
+                       "Finished cleanly. Download the trained `.pt` weights here."),
+        "cancelled":  ("🚫 Cancelled / Terminated",
+                       "Stopped from the console, cut short by the runtime cap, or ended "
+                       "without reporting completion. No finished model."),
+        "failed":     ("❌ Failed", "Errored on Kaggle before producing a model."),
+    }
+
     def _render_gpu_panel(prog):
         """GPU utilisation cards + history chart from remote telemetry."""
         latest = prog.get("gpu_latest") or []
@@ -1478,24 +1499,51 @@ with tab_kaggle:
             if j.get("failureMessage"):
                 st.error(f"Kernel failure: {j['failureMessage']}")
 
-            # Weights + ingest: offered for anything that might have finished.
-            can_have_output = status in ("complete", "error", "cancelled") or stale
-            if can_have_output:
+            category = kaggle_bridge.classify_job(j)
+
+            if category == "cancelled":
+                st.warning(f"🚫 {kaggle_bridge.job_termination_reason(j)}.")
+            elif category == "failed":
+                st.error("❌ This run failed on Kaggle. No trained model was produced — "
+                         "check the log below for the cause.")
+
+            # A trained model is only offered where one actually exists. A
+            # cancelled/terminated run may still hold a partial last.pt, which is
+            # useful for resuming but is not a finished model.
+            if category == "successful":
+                st.markdown("##### 🎯 Trained model")
+                st.caption("Downloads are model weights only (`best.pt` / `last.pt`).")
                 exp_name = st.text_input(
                     "Save into yolo_workspace/runs/",
                     value=j.get("target_exp") or "kaggle_exp1", key=f"exp_{ref}",
                 )
-                wc1, wc2, wc3 = st.columns(3)
-                with wc1:
-                    if st.button("⬇ Fetch best.pt & last.pt", key=f"w_{ref}",
-                                 type="primary", use_container_width=True):
-                        with st.spinner("Downloading weights from Kaggle..."):
-                            ok, msg, saved = kaggle_bridge.download_weights(
-                                ref, dest_dir=kaggle_bridge.RUNS_DIR / exp_name / "weights")
-                        (st.success if ok else st.warning)(msg)
-                        st.session_state[f"weights_{ref}"] = (
-                            {k: str(v) for k, v in saved.items()} if ok else {})
-                with wc2:
+                if st.button("⬇ Fetch model (.pt) from Kaggle", key=f"w_{ref}",
+                             type="primary", use_container_width=True):
+                    with st.spinner("Downloading model weights from Kaggle..."):
+                        ok, msg, saved = kaggle_bridge.download_weights(
+                            ref, dest_dir=kaggle_bridge.RUNS_DIR / exp_name / "weights")
+                    (st.success if ok else st.warning)(msg)
+                    st.session_state[f"weights_{ref}"] = (
+                        {k: str(v) for k, v in saved.items()} if ok else {})
+
+                _saved = st.session_state.get(f"weights_{ref}") or {}
+                if _saved:
+                    dl_cols = st.columns(len(_saved))
+                    for col, (wname, wpath) in zip(dl_cols, sorted(_saved.items())):
+                        try:
+                            data = Path(wpath).read_bytes()
+                        except OSError:
+                            continue
+                        with col:
+                            st.download_button(
+                                f"💾 {wname}  ({len(data)/(1024*1024):.1f} MB)", data=data,
+                                file_name=f"{ref.split('/')[-1]}_{wname}",
+                                mime="application/octet-stream",
+                                key=f"dl_{ref}_{wname}", use_container_width=True)
+
+                with st.expander("Full run artifacts (metrics, curves, plots)"):
+                    st.caption("Pulls the whole run into yolo_workspace/runs/ so it shows up in "
+                               "Inference, Export Studio and Run History.")
                     if st.button("📥 Ingest full run", key=f"ing_{ref}", use_container_width=True):
                         with st.spinner("Downloading run output from Kaggle..."):
                             ok, msg, run_path = kaggle_bridge.download_and_ingest_artifacts(ref, exp_name)
@@ -1515,30 +1563,36 @@ with tab_kaggle:
                                     st.success(f"📦 {fmt.upper()} → `{out}`")
                                 for fmt, err in failed:
                                     st.warning(f"{fmt.upper()} export failed: {err}")
-                with wc3:
-                    if st.button("📊 Progress / log / GPU", key=f"log_{ref}", use_container_width=True):
-                        with st.spinner("Pulling log from Kaggle..."):
-                            st.session_state[f"prog_{ref}"] = kaggle_bridge.get_training_progress(ref)
 
-                if st.session_state.get(f"prog_{ref}"):
-                    _render_progress(st.session_state[f"prog_{ref}"])
-
-                for wname, wpath in (st.session_state.get(f"weights_{ref}") or {}).items():
+            elif category == "cancelled":
+                st.caption("A partial `last.pt` may exist. It is not a finished model, but it can "
+                           "seed a resume job from the dispatcher above.")
+                if st.button("⬇ Fetch partial checkpoint (.pt)", key=f"w_{ref}",
+                             use_container_width=True):
+                    with st.spinner("Checking Kaggle for a partial checkpoint..."):
+                        ok, msg, saved = kaggle_bridge.download_weights(
+                            ref, dest_dir=kaggle_bridge.RUNS_DIR /
+                            (j.get("target_exp") or "kaggle_partial") / "weights")
+                    (st.success if ok else st.warning)(msg)
+                    st.session_state[f"weights_{ref}"] = (
+                        {k: str(v) for k, v in saved.items()} if ok else {})
+                for wname, wpath in sorted((st.session_state.get(f"weights_{ref}") or {}).items()):
                     try:
-                        with open(wpath, "rb") as fh:
-                            st.download_button(
-                                f"💾 Download {wname}", data=fh.read(),
-                                file_name=f"{ref.split('/')[-1]}_{wname}",
-                                mime="application/octet-stream",
-                                key=f"dl_{ref}_{wname}", use_container_width=True)
+                        data = Path(wpath).read_bytes()
                     except OSError:
-                        pass
-            else:
-                if st.button("📊 Fetch progress / log", key=f"prog_btn_{ref}", use_container_width=True):
-                    with st.spinner("Pulling latest log from Kaggle..."):
-                        st.session_state[f"prog_{ref}"] = kaggle_bridge.get_training_progress(ref)
-                if st.session_state.get(f"prog_{ref}"):
-                    _render_progress(st.session_state[f"prog_{ref}"])
+                        continue
+                    st.download_button(
+                        f"💾 {wname} (partial, {len(data)/(1024*1024):.1f} MB)", data=data,
+                        file_name=f"{ref.split('/')[-1]}_{wname}",
+                        mime="application/octet-stream",
+                        key=f"dl_{ref}_{wname}", use_container_width=True)
+
+            # Log / progress is useful for every category.
+            if st.button("📊 Progress / log / GPU", key=f"log_{ref}", use_container_width=True):
+                with st.spinner("Pulling log from Kaggle..."):
+                    st.session_state[f"prog_{ref}"] = kaggle_bridge.get_training_progress(ref)
+            if st.session_state.get(f"prog_{ref}"):
+                _render_progress(st.session_state[f"prog_{ref}"])
 
             # Stopping a run is a Kaggle-side action: the public API has no
             # cancel endpoint, so removing it locally would leave it running and
@@ -1547,7 +1601,7 @@ with tab_kaggle:
             act1, act2 = st.columns(2)
             with act1:
                 if _ongoing and st.button("🛑 Stop this job", key=f"stop_{ref}",
-                                          use_container_width=True):
+                                          type="primary", use_container_width=True):
                     with st.spinner("Checking live status on Kaggle..."):
                         stopped, stop_msg, stop_url = kaggle_bridge.request_kernel_stop(ref)
                     if stopped:
@@ -1555,7 +1609,7 @@ with tab_kaggle:
                         st.session_state.jobs_nonce += 1
                     else:
                         st.warning(stop_msg)
-                        st.markdown(f"➡️ **[Open the session page to stop it]({stop_url})**")
+                        st.markdown(_STOP_STEPS.format(url=stop_url))
             with act2:
                 if st.button("🗑 Remove from this list", key=f"del_{ref}",
                              use_container_width=True):
@@ -1591,21 +1645,32 @@ with tab_kaggle:
         if not all_jobs:
             st.info("No training jobs dispatched yet. Launch one above and it will appear here.")
             return
-        ongoing = [j for j in all_jobs if j.get("is_ongoing")]
-        finished = [j for j in all_jobs if not j.get("is_ongoing")]
-        if ongoing:
-            st.markdown(f"**Ongoing — {len(ongoing)}**")
-            st.caption(
-                "⚠️ Kaggle's public API has no cancel endpoint, so a running job can only be "
-                "stopped from the Kaggle web console — use **🛑 Stop this job** for the direct "
-                "link. Removing a job from this list does not stop it."
-            )
-            for j in ongoing:
-                _render_job(j, open_default=True)
-        if finished:
-            st.markdown(f"**Completed / Failed — {len(finished)}**")
-            for j in finished:
-                _render_job(j, open_default=(j["status"] == "complete"))
+        buckets = {c: [] for c in kaggle_bridge.JOB_CATEGORIES}
+        for j in all_jobs:
+            buckets[kaggle_bridge.classify_job(j)].append(j)
+
+        counts = " · ".join(
+            f"{_SECTIONS[c][0].split(' ', 1)[0]} {len(buckets[c])}"
+            for c in kaggle_bridge.JOB_CATEGORIES if buckets[c]
+        )
+        if counts:
+            st.caption(f"**{len(all_jobs)} tracked** — {counts}")
+
+        for cat in kaggle_bridge.JOB_CATEGORIES:
+            jobs = buckets[cat]
+            if not jobs:
+                continue
+            title, blurb = _SECTIONS[cat]
+            st.markdown(f"#### {title} — {len(jobs)}")
+            st.caption(blurb)
+            if cat == "ongoing":
+                st.caption(
+                    "⚠️ Kaggle's public API has no cancel endpoint, so a running job can only be "
+                    "stopped from the Kaggle web console. **🛑 Stop this job** shows the exact "
+                    "steps. Removing a job from this list does not stop it."
+                )
+            for j in jobs:
+                _render_job(j, open_default=(cat in ("ongoing", "successful")))
 
     with st.spinner("Fetching job status from Kaggle..."):
         _jobs_dashboard()

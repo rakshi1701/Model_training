@@ -53,7 +53,18 @@ A comprehensive Streamlit workspace for managing the entire lifecycle of YOLO co
 
 > **Note on the quota tracker:** Kaggle publishes no quota API. The figure is estimated from jobs dispatched by this dashboard — runs you start on kaggle.com are not counted. Confirm at [kaggle.com/settings](https://www.kaggle.com/settings).
 
-> **Stopping a cloud job:** Kaggle's public API has **no cancel endpoint** ([kaggle-api#388](https://github.com/Kaggle/kaggle-api/issues/388)), so a running kernel can only be stopped from the Kaggle web console. **🛑 Stop this job** checks live status and links straight to the session page — use **Stop Session** there. **🗑 Remove from this list** is local tracking only and warns before orphaning a job that is still running. Once you stop it on Kaggle, the dashboard picks up the cancelled status on the next refresh.
+**Job dashboard** — tracked runs are grouped into four sections, each with its own actions:
+
+| Section | Meaning | Model download |
+| :--- | :--- | :--- |
+| 🟢 **Ongoing** | Running or queued on Kaggle | — (offers **Stop this job**) |
+| 🎉 **Successful** | Finished cleanly | ✅ `best.pt` / `last.pt`, with full-run ingest tucked behind an expander |
+| 🚫 **Cancelled / Terminated** | Stopped from the console, cut short by the runtime cap, or ended without reporting completion | Partial `last.pt` only, labelled as such (useful to seed a resume) |
+| ❌ **Failed** | Errored before producing a model | — (log only) |
+
+Downloads in the dashboard are **model weights only** (`.pt`). Metrics, curves and plots come through **Ingest full run**, which places them in `yolo_workspace/runs/` for Inference, Export Studio and Run History.
+
+> **Stopping a cloud job:** Kaggle's public API has **no cancel endpoint** ([kaggle-api#388](https://github.com/Kaggle/kaggle-api/issues/388)), and there is no direct URL for the Active Events panel, so **🛑 Stop this job** shows the exact click path: any Kaggle page → left sidebar **⧉ View Active Events** → **⋯** next to the session → **⏹ Stop Session**. The kernel page's Run/Save controls do *not* stop a running batch job. **🗑 Remove from this list** is local tracking only and warns before orphaning a job that is still running. Once stopped, the dashboard picks up the cancelled status on the next refresh.
 
 ### 6. 📊 Run History & Comparisons
 - Automatically tracks all training experiments in `yolo_workspace/runs/`.
