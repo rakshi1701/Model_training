@@ -96,6 +96,19 @@ streamlit run app.py
 
 Opens at `http://localhost:8501`.
 
+### Native desktop build (Qt/QML)
+
+The same seven tabs, the same workspace and the same engine, in a native window:
+
+```bash
+pip install -r qt_dashboard/requirements.txt
+python3 qt_dashboard/main.py
+```
+
+On Linux/X11 Qt 6.5+ also needs `libxcb-cursor0` (`sudo apt install libxcb-cursor0`).
+Both front-ends read and write `yolo_workspace/`, so a run started in one shows
+up in the other. See [`qt_dashboard/README.md`](qt_dashboard/README.md).
+
 ---
 
 ## 📁 Dataset Format & 50GB Uploads
@@ -116,6 +129,36 @@ my_dataset.zip
 - Upload limit is configured up to **50GB** in `.streamlit/config.toml`.
 - Roboflow relative path discrepancies (e.g. `../train/images`) are automatically detected and patched to absolute paths during extraction.
 
+### Multiple datasets, side by side
+
+Each upload is extracted into its own folder under `yolo_workspace/dataset/` and
+**added** to the list — it never replaces what is already there. A zip that wraps
+everything in one top-level folder keeps that folder's name; anything else is
+named after the zip, and a name that is already taken gets a `-2`, `-3` suffix.
+The newly extracted dataset becomes the active one, and every dataset in the
+workspace stays selectable in the sidebar. When a training run is finished,
+**🗑 Remove `<name>` from workspace** deletes that one dataset (with a
+confirmation step). Only datasets inside `yolo_workspace/dataset/` can be
+removed — a custom path pointing outside the workspace never can.
+
+### Classification datasets
+
+A folder-per-class set has no `data.yaml`, so it is discovered by its structure
+instead and listed as **Classification Dataset (name)**:
+
+```
+my_classes.zip
+└── PetImages/
+    ├── Cat/*.jpg
+    └── Dog/*.jpg
+```
+
+Train it with **Task = `classify`** — Ultralytics reads the folder directly, so
+there is no yaml to select. The classify task needs the split on disk, so if the
+export is flat (no `train/` and `val/`), the Dataset Hub offers **✂️ Create
+train/val split**, which moves the images into `train/<class>/` and
+`val/<class>/` at a validation share you choose.
+
 ---
 
 ## 📂 Workspace Structure
@@ -123,6 +166,7 @@ my_dataset.zip
 ```
 .
 ├── app.py                            # Main Streamlit Vision Studio
+├── qt_dashboard/                     # Native Qt/QML desktop build of the same dashboard
 ├── kaggle_bridge.py                  # Kaggle Cloud API Integration & Sync Engine
 ├── kaggle_yolo_train_template.ipynb  # Standalone Kaggle Notebook Template
 ├── Requirements.txt                  # Dependencies

@@ -1,0 +1,4 @@
+# Qt/QML front-end only. The engine dependencies (ultralytics, opencv, pandas,
+# psutil, pyyaml, kaggle) are the ones already listed in ../Requirements.txt —
+# the Qt dashboard drives the same code and the same workspace.
+PySide6>=6.6

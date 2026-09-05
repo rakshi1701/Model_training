@@ -222,12 +222,197 @@ def safe_rmtree(path: Path):
             pass
 
 
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def _has_images(d: Path) -> bool:
+    """True if the directory holds at least one image directly."""
+    try:
+        return any(f.is_file() and f.suffix.lower() in IMAGE_SUFFIXES for f in d.iterdir())
+    except OSError:
+        return False
+
+
+def _is_detection_layout(d: Path) -> bool:
+    """True for a YOLO detection folder — images/ (+ labels/) rather than classes."""
+    try:
+        names = {c.name.lower() for c in d.iterdir() if c.is_dir()}
+    except OSError:
+        return False
+    return "images" in names or "labels" in names
+
+
+def classify_splits(root: Path):
+    """Split map for a classification-style dataset (a folder per class), else None.
+
+    Handles both the Ultralytics layout (root/train/<class>/, root/val/<class>/)
+    and a flat export such as PetImages/Cat, PetImages/Dog with no split yet.
+    A YOLO detection tree also has train/ and val/, so a split holding images/
+    or labels/ rules classification out.
+    """
+    if not root.is_dir():
+        return None
+    if _is_detection_layout(root):
+        return None
+    splits = {}
+    for name in ("train", "val", "valid", "test"):
+        sub = root / name
+        if not sub.is_dir() or _is_detection_layout(sub):
+            continue
+        if any(c.is_dir() and _has_images(c) for c in sub.iterdir()):
+            splits[name] = sub
+    if splits:
+        return splits
+    classes = [c for c in root.iterdir() if c.is_dir() and _has_images(c)]
+    return {"all": root} if len(classes) >= 2 else None
+
+
+def make_classify_split(root: Path, val_fraction: float = 0.2, progress=None):
+    """Turns root/<class>/*.jpg into root/train/<class> + root/val/<class>.
+
+    Ultralytics' classify task needs the split on disk; a flat class-folder
+    export (Cat/, Dog/) has none. Files are moved, so this is cheap even for
+    tens of thousands of images.
+    """
+    class_dirs = [c for c in sorted(root.iterdir())
+                  if c.is_dir() and c.name not in ("train", "val", "valid", "test")]
+    if not class_dirs:
+        return 0, 0
+    n_train = n_val = 0
+    for cdir in class_dirs:
+        images = sorted(f for f in cdir.rglob("*") if f.suffix.lower() in IMAGE_SUFFIXES)
+        if not images:
+            continue
+        cut = max(1, int(len(images) * (1 - val_fraction)))
+        for split, files in (("train", images[:cut]), ("val", images[cut:])):
+            target = root / split / cdir.name
+            target.mkdir(parents=True, exist_ok=True)
+            for f in files:
+                try:
+                    f.rename(target / f.name)
+                except OSError:
+                    continue
+            if split == "train":
+                n_train += len(files)
+            else:
+                n_val += len(files)
+        if progress:
+            progress(f"{cdir.name}: {len(images)} images split")
+        safe_rmtree(cdir)
+    return n_train, n_val
+
+
+def resolve_split_dir(base: Path, yaml_dir: Path, rel: str, explicit_base: bool = False):
+    """Finds a split directory named by a data.yaml entry.
+
+    Roboflow exports write `../train/images`, which escapes the dataset folder.
+    Datasets now sit side by side under dataset/, so that stray path can land on
+    a *neighbour's* split — a candidate inside the dataset's own folder wins
+    unless the yaml set `path:` explicitly.
+    """
+    p = Path(rel)
+    if p.is_absolute():
+        return p if p.exists() else None
+    stripped = Path(*[part for part in p.parts if part != ".."]) if ".." in p.parts else None
+
+    inside = []
+    if stripped is not None:
+        inside.append((yaml_dir / stripped).resolve())
+    inside.append((yaml_dir / p).resolve())
+    declared = (base / p).resolve()
+
+    seen = set()
+    for cand in ([declared] + inside) if explicit_base else (inside + [declared]):
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if cand.exists():
+            return cand
+    return None
+
+
+def normalize_dataset_yaml(root: Path) -> bool:
+    """Rewrites split paths that escape the dataset folder to stay inside it.
+
+    Ultralytics resolves these paths itself at training time, so they are fixed
+    on disk rather than only in how the dashboard reads them.
+    """
+    changed_any = False
+    for y in list(root.rglob("*.yaml")) + list(root.rglob("*.yml")):
+        try:
+            cfg = yaml.safe_load(y.read_text()) or {}
+        except Exception:
+            continue
+        if not isinstance(cfg, dict) or "path" in cfg:
+            continue        # an explicit `path:` is the author's own decision
+        changed = False
+        for split in ("train", "val", "valid", "test"):
+            rel = cfg.get(split)
+            if not isinstance(rel, str) or Path(rel).is_absolute():
+                continue
+            p = Path(rel)
+            if ".." not in p.parts:
+                continue
+            stripped = Path(*[part for part in p.parts if part != ".."])
+            if (y.parent / stripped).exists():
+                cfg[split] = stripped.as_posix()
+                changed = True
+        if changed:
+            try:
+                y.write_text(yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False))
+                changed_any = True
+            except OSError:
+                pass
+    return changed_any
+
+
+def unique_dataset_dir(name: str) -> Path:
+    """A free folder under dataset/ for `name`, suffixed if it is taken."""
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "dataset"
+    dest = DATASET_DIR / base
+    i = 2
+    while dest.exists():
+        dest = DATASET_DIR / f"{base}-{i}"
+        i += 1
+    return dest
+
+
+def install_extracted_dataset(staging: Path, zip_name: str) -> Path:
+    """Moves a staged extraction into its own folder under dataset/.
+
+    A zip that wraps everything in one top-level folder keeps that folder's
+    name; anything else is named after the zip.
+    """
+    entries = [e for e in staging.iterdir() if not e.name.startswith("__MACOSX")]
+    if len(entries) == 1 and entries[0].is_dir():
+        src_root, base = entries[0], entries[0].name
+    else:
+        src_root, base = staging, Path(zip_name).stem
+    dest = unique_dataset_dir(base)
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
+    src_root.rename(dest)
+    normalize_dataset_yaml(dest)
+    return dest
+
+
 def discover_all_datasets():
-    """Finds all available datasets in workspace and dataset directory."""
+    """Every dataset in the workspace, keyed by the label shown in the selector.
+
+    Detection sets are found by their data.yaml; classification sets have no
+    yaml, so a folder of class subdirectories counts as one too. Datasets sit
+    side by side under yolo_workspace/dataset/ and are listed together.
+    """
     datasets = {}
     if DATASET_DIR.exists():
         for y_path in list(DATASET_DIR.rglob("*.yaml")) + list(DATASET_DIR.rglob("*.yml")):
             datasets[f"Extracted Dataset ({y_path.parent.name})"] = y_path.resolve()
+        for child in sorted(DATASET_DIR.iterdir()):
+            if not child.is_dir():
+                continue
+            if list(child.rglob("*.yaml")) or list(child.rglob("*.yml")):
+                continue    # already listed above by its yaml
+            if classify_splits(child):
+                datasets[f"Classification Dataset ({child.name})"] = child.resolve()
     for root_dir in Path(".").glob("*/"):
         if root_dir.is_dir() and root_dir.name != "yolo_workspace" and not root_dir.name.startswith("."):
             for y_path in list(root_dir.glob("*.yaml")) + list(root_dir.glob("*.yml")):
@@ -235,10 +420,35 @@ def discover_all_datasets():
     return datasets
 
 
-def get_dataset_info(yaml_path: Path):
-    """Parses dataset yaml and returns statistics."""
-    if not yaml_path or not yaml_path.exists():
+def _classify_dataset_info(root: Path):
+    """Stats for a class-folder dataset, shaped like the yaml version."""
+    splits = classify_splits(root)
+    if not splits:
         return None
+    class_names, counts, split_paths = [], {}, {}
+    for split, sdir in splits.items():
+        class_dirs = sorted(c for c in sdir.iterdir() if c.is_dir() and _has_images(c))
+        for c in class_dirs:
+            if c.name not in class_names:
+                class_names.append(c.name)
+        counts[split] = sum(1 for f in sdir.rglob("*")
+                            if f.suffix.lower() in IMAGE_SUFFIXES)
+        split_paths[split] = sdir
+    return {
+        "config": {}, "classes": {i: n for i, n in enumerate(sorted(class_names))},
+        "counts": counts, "splits": split_paths, "yaml_path": root,
+        "name": root.name, "kind": "classify", "root": root,
+        "needs_split": list(splits) == ["all"],
+    }
+
+
+def get_dataset_info(yaml_path: Path):
+    """Parses a dataset yaml (or a class-folder dataset) and returns statistics."""
+    if not yaml_path or not Path(yaml_path).exists():
+        return None
+    yaml_path = Path(yaml_path)
+    if yaml_path.is_dir():
+        return _classify_dataset_info(yaml_path)
     try:
         with open(yaml_path, "r") as f:
             cfg = yaml.safe_load(f) or {}
@@ -257,8 +467,9 @@ def get_dataset_info(yaml_path: Path):
         for split in ["train", "val", "valid", "test"]:
             rel = cfg.get(split)
             if rel:
-                p = (base / rel).resolve() if not Path(rel).is_absolute() else Path(rel)
-                if p.exists():
+                p = resolve_split_dir(base, yaml_path.parent, str(rel),
+                                      explicit_base="path" in cfg)
+                if p:
                     n_imgs = sum(1 for img in p.rglob("*") if img.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".bmp"])
                     counts[split] = n_imgs
                     split_paths[split] = p
@@ -268,7 +479,11 @@ def get_dataset_info(yaml_path: Path):
             "classes": class_list,
             "counts": counts,
             "splits": split_paths,
-            "yaml_path": yaml_path
+            "yaml_path": yaml_path,
+            "name": yaml_path.parent.name,
+            "kind": "detect",
+            "root": yaml_path.parent,
+            "needs_split": False,
         }
     except Exception:
         return None
@@ -527,25 +742,73 @@ st.sidebar.markdown("#### 📁 Active Dataset")
 discovered_datasets = discover_all_datasets()
 dataset_options = list(discovered_datasets.keys()) + ["➕ Upload New Dataset (.zip)", "🔍 Enter Custom Path"]
 
-selected_ds_source = st.sidebar.selectbox("Dataset Source", dataset_options, index=0 if dataset_options else 0)
+# A dataset that was just extracted becomes the active one on the next run.
+_pending = st.session_state.pop("pending_dataset", None)
+if _pending:
+    for label, path in discovered_datasets.items():
+        if str(path).startswith(_pending):
+            st.session_state.ds_source_select = label
+            break
+# Drop a selection that points at a dataset which no longer exists.
+if st.session_state.get("ds_source_select") not in dataset_options:
+    st.session_state.pop("ds_source_select", None)
+
+selected_ds_source = st.sidebar.selectbox(
+    "Dataset Source", dataset_options, key="ds_source_select"
+)
 
 data_yaml_path = None
 if selected_ds_source == "➕ Upload New Dataset (.zip)":
     uploaded_zip = st.sidebar.file_uploader("Upload .zip (up to 50GB)", type=["zip"])
+    st.sidebar.caption("Datasets are kept side by side — a new upload is added, not replacing "
+                       "what is already there. Remove one from the list below when you're done.")
     if uploaded_zip and st.sidebar.button("📦 Extract & Activate", width="stretch"):
-        if DATASET_DIR.exists():
-            safe_rmtree(DATASET_DIR)
-        DATASET_DIR.mkdir(parents=True, exist_ok=True)
-        zip_path = DATASET_DIR / "upload.zip"
-        with open(zip_path, "wb") as f:
-            f.write(uploaded_zip.getbuffer())
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(DATASET_DIR)
-        zip_path.unlink()
+        # A big zip takes long enough that Streamlit can start a second script
+        # run over the top of this one. Two runs wiping and filling the same
+        # folder used to race (rm -rf walking the tree the other was extracting
+        # into, taking its upload.zip with it), so: refuse to re-enter, stage
+        # everything outside DATASET_DIR, and only swap it in once it's whole.
+        if st.session_state.get("ds_extracting"):
+            st.sidebar.warning("An extraction is already running — give it a moment.")
+        else:
+            st.session_state.ds_extracting = True
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            zip_path = TEMP_DIR / f"upload_{stamp}.zip"
+            staging = TEMP_DIR / f"extract_{stamp}"
+            try:
+                with st.spinner("Extracting dataset — this can take a while for large zips..."):
+                    staging.mkdir(parents=True, exist_ok=True)
+                    with open(zip_path, "wb") as f:
+                        f.write(uploaded_zip.getbuffer())
+                    with zipfile.ZipFile(zip_path, "r") as z:
+                        z.extractall(staging)
 
-        yamls = list(DATASET_DIR.rglob("*.yaml")) + list(DATASET_DIR.rglob("*.yml"))
-        if yamls:
-            st.sidebar.success("Dataset extracted and activated!")
+                    dest = install_extracted_dataset(staging, uploaded_zip.name)
+
+                info = get_dataset_info(dest) or {}
+                if list(dest.rglob("*.yaml")) or list(dest.rglob("*.yml")):
+                    st.session_state.pending_dataset = str(dest)
+                    st.sidebar.success(f"Dataset `{dest.name}` extracted and activated!")
+                elif info.get("kind") == "classify":
+                    st.session_state.pending_dataset = str(dest)
+                    st.sidebar.success(
+                        f"Classification dataset `{dest.name}` added "
+                        f"({len(info.get('classes', {}))} classes)."
+                    )
+                else:
+                    st.sidebar.warning(
+                        f"Extracted to `{dest.name}`, but it has no data.yaml and no class "
+                        "folders. Training needs a YOLO-format zip (data.yaml + images/ + "
+                        "labels/) or a folder-per-class classification set."
+                    )
+            except zipfile.BadZipFile:
+                st.sidebar.error("That file is not a readable .zip archive.")
+            except Exception as e:
+                st.sidebar.error(f"Extraction failed: {e}")
+            finally:
+                zip_path.unlink(missing_ok=True)
+                safe_rmtree(staging)
+                st.session_state.ds_extracting = False
             st.rerun()
 
 elif selected_ds_source == "🔍 Enter Custom Path":
@@ -566,13 +829,37 @@ if ds_info:
         classes_str += "..."
     st.sidebar.markdown(f"""
     <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 10px; font-size: 0.8rem; margin-bottom: 12px;">
-        <div style="font-weight: 700; color: #38bdf8;">📄 {ds_info['yaml_path'].parent.name}</div>
+        <div style="font-weight: 700; color: #38bdf8;">📄 {ds_info.get('name', ds_info['yaml_path'].parent.name)}{' · classify' if ds_info.get('kind') == 'classify' else ''}</div>
         <div style="color: #cbd5e1; margin-top: 4px;">🖼️ <b>Images:</b> {counts_str or 'None detected'}</div>
         <div style="color: #cbd5e1;">🏷️ <b>Classes ({len(ds_info['classes'])}):</b> {classes_str or 'None'}</div>
     </div>
     """, unsafe_allow_html=True)
 else:
     st.sidebar.info("Select or upload a dataset to begin training.")
+
+# Remove a dataset once its training is done. Only datasets that live inside
+# yolo_workspace/dataset/ can be deleted — a custom path outside the workspace
+# is somebody else's data.
+if ds_info:
+    _root = Path(ds_info.get("root", ds_info["yaml_path"]))
+    _removable = DATASET_DIR.resolve() in _root.resolve().parents
+    if _removable:
+        _confirm_key = f"confirm_del_ds_{_root}"
+        if st.session_state.get(_confirm_key):
+            st.sidebar.warning(f"Delete `{_root.name}` and everything in it?")
+            c_yes, c_no = st.sidebar.columns(2)
+            if c_yes.button("🗑 Delete", type="primary", width="stretch"):
+                safe_rmtree(_root)
+                st.session_state.pop(_confirm_key, None)
+                st.session_state.pop("ds_source_select", None)
+                st.toast(f"Removed dataset {_root.name}", icon="🗑")
+                st.rerun()
+            if c_no.button("Cancel", width="stretch"):
+                st.session_state.pop(_confirm_key, None)
+                st.rerun()
+        elif st.sidebar.button(f"🗑 Remove `{_root.name}` from workspace", width="stretch"):
+            st.session_state[_confirm_key] = True
+            st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.caption("🚀 **YOLO Vision Studio v2.5** • Google Deepmind AGY")
@@ -1184,7 +1471,10 @@ with tab_kaggle:
         if datasets_map:
             k_selected_ds = st.selectbox("Select Dataset to Train On", list(datasets_map.keys()), key="k_ds_select")
             k_ds_yaml_path = datasets_map[k_selected_ds]
-            k_ds_folder = k_ds_yaml_path.parent
+            # A classification dataset is a directory, not a yaml — staging must
+            # upload that folder, not everything under dataset/.
+            k_ds_folder = (k_ds_yaml_path if k_ds_yaml_path.is_dir()
+                           else k_ds_yaml_path.parent)
         else:
             st.warning("No datasets detected in workspace. Upload or extract a dataset in Dataset Hub.")
             k_ds_yaml_path = None
@@ -1753,6 +2043,32 @@ with tab_ds:
     if not ds_info:
         st.warning("No active dataset selected. Please choose or upload a dataset in the sidebar.")
     else:
+        if ds_info.get("kind") == "classify":
+            st.info(
+                f"**`{ds_info['name']}` is a classification dataset** "
+                f"({len(ds_info['classes'])} classes, folder per class). Train it with "
+                "**Task = classify** in the Training tab — Ultralytics reads the folder "
+                "directly, so there is no data.yaml to select."
+            )
+            if ds_info.get("needs_split"):
+                st.warning(
+                    "It has no train/val split yet, which the classify task requires. "
+                    "Split it below — images are moved into `train/` and `val/` in place."
+                )
+                sp1, sp2 = st.columns([1, 3])
+                with sp1:
+                    val_pct = st.slider("Validation %", 5, 40, 20, step=5, key="cls_val_pct")
+                with sp2:
+                    st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+                    if st.button("✂️ Create train/val split", type="primary", key="cls_split_btn"):
+                        with st.status("Splitting dataset...", expanded=True) as sbox:
+                            n_tr, n_va = make_classify_split(
+                                Path(ds_info["root"]), val_pct / 100.0,
+                                progress=lambda m: sbox.write(f"  ➜ {m}"))
+                            sbox.update(label=f"Split complete: {n_tr} train / {n_va} val",
+                                        state="complete")
+                        st.rerun()
+
         ds_col1, ds_col2 = st.columns([1, 2])
 
         with ds_col1:

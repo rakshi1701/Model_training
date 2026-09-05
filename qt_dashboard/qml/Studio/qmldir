@@ -1,0 +1,21 @@
+module Studio
+singleton Theme 1.0 Theme.qml
+Card 1.0 Card.qml
+SectionTitle 1.0 SectionTitle.qml
+MetricCard 1.0 MetricCard.qml
+StatusBadge 1.0 StatusBadge.qml
+StudioButton 1.0 StudioButton.qml
+StudioCombo 1.0 StudioCombo.qml
+StudioText 1.0 StudioText.qml
+StudioSpin 1.0 StudioSpin.qml
+StudioCheck 1.0 StudioCheck.qml
+StudioSlider 1.0 StudioSlider.qml
+StudioSwitch 1.0 StudioSwitch.qml
+Field 1.0 Field.qml
+LogView 1.0 LogView.qml
+MetricChart 1.0 MetricChart.qml
+BarMeter 1.0 BarMeter.qml
+ProgressBarLine 1.0 ProgressBarLine.qml
+DataTable 1.0 DataTable.qml
+InfoNote 1.0 InfoNote.qml
+singleton Notifier 1.0 Notifier.qml
