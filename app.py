@@ -1416,6 +1416,31 @@ with tab_kaggle:
                 except Exception as e:
                     st.error(f"Invalid JSON file: {e}")
 
+            if is_auth:
+                st.markdown("---")
+                _paths = kaggle_bridge.stored_credential_paths()
+                if st.session_state.get("confirm_kaggle_logout"):
+                    st.warning(
+                        f"Remove the stored credentials for **@{kaggle_user}**?\n\n"
+                        + ("Deletes:\n" + "\n".join(f"- `{p}`" for p in _paths)
+                           if _paths else "No credential files found — this clears the session only.")
+                        + "\n\nThe token keeps working elsewhere until you revoke it at "
+                          "[kaggle.com/settings](https://www.kaggle.com/settings)."
+                    )
+                    lo1, lo2 = st.columns(2)
+                    if lo1.button("🚪 Disconnect", type="primary", use_container_width=True):
+                        ok, msg = kaggle_bridge.clear_credentials()
+                        st.session_state.pop("confirm_kaggle_logout", None)
+                        (st.success if ok else st.error)(msg)
+                        time.sleep(1)
+                        st.rerun()
+                    if lo2.button("Cancel", use_container_width=True):
+                        st.session_state.pop("confirm_kaggle_logout", None)
+                        st.rerun()
+                elif st.button("🚪 Disconnect account", use_container_width=True):
+                    st.session_state.confirm_kaggle_logout = True
+                    st.rerun()
+
             st.markdown("*Or enter manually:*")
             k_user_input = st.text_input("Kaggle Username (handle, not email)", value=kaggle_user or "", placeholder="e.g. rakshithr1701")
             k_key_input = st.text_input("Kaggle API Key", type="password", placeholder="e.g. 38d9c...")

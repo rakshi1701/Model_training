@@ -163,6 +163,21 @@ class KaggleController(QObject):
 
         run_async(work, on_done=done, on_error=fail)
 
+    @Property("QStringList", notify=authChanged)
+    def credentialPaths(self):
+        """Credential files that a disconnect would delete."""
+        return [str(p) for p in kaggle_bridge.stored_credential_paths()]
+
+    @Slot()
+    def disconnectAccount(self):
+        """Removes this machine's stored Kaggle credentials."""
+        ok, msg = kaggle_bridge.clear_credentials()
+        self.toast.emit(msg, "success" if ok else "error")
+        self._quota = {}
+        self.quotaChanged.emit()
+        self.refreshAuth()
+        self.refreshJobs()
+
     @Slot(str)
     def importKaggleJson(self, url):
         try:

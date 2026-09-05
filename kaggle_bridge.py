@@ -279,6 +279,55 @@ def save_credentials(username: str, key: str) -> Tuple[bool, str]:
         return False, f"Failed to save credentials: {str(e)}"
 
 
+CREDENTIAL_FILES = (KAGGLE_JSON, KAGGLE_CONFIG_JSON,
+                    KAGGLE_ACCESS_TOKEN, KAGGLE_CONFIG_ACCESS_TOKEN)
+CREDENTIAL_ENV_VARS = ("KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_API_TOKEN")
+
+
+def stored_credential_paths() -> List[Path]:
+    """Credential files that currently exist on this machine."""
+    return [p for p in CREDENTIAL_FILES if p.exists()]
+
+
+def clear_credentials() -> Tuple[bool, str]:
+    """Signs this machine out of Kaggle.
+
+    Deletes the stored kaggle.json / access_token files and drops the env vars
+    exported by _apply_auth_env, so is_authenticated() reports disconnected
+    until a token is supplied again. The token itself keeps working elsewhere —
+    only kaggle.com/settings can revoke it.
+    """
+    removed, failed = [], []
+    for path in CREDENTIAL_FILES:
+        try:
+            if path.exists():
+                path.unlink()
+                removed.append(str(path))
+        except OSError as e:
+            failed.append(f"{path}: {e}")
+
+    # A var inherited from the shell comes back on the next launch; say so
+    # rather than claiming a clean disconnect.
+    from_shell = [v for v in CREDENTIAL_ENV_VARS if os.environ.get(v)]
+    for var in CREDENTIAL_ENV_VARS:
+        os.environ.pop(var, None)
+
+    if failed:
+        return False, "Could not remove: " + "; ".join(failed)
+
+    if removed:
+        msg = f"Disconnected — removed {len(removed)} credential file(s)."
+    elif from_shell:
+        msg = "Disconnected for this session."
+    else:
+        msg = "No stored Kaggle credentials were found."
+    if from_shell:
+        verb = "were" if len(from_shell) > 1 else "was"
+        msg += (" Note: " + ", ".join(from_shell) + f" {verb} set in the environment — if your "
+                "shell exports them, they return on the next launch.")
+    return True, msg
+
+
 def format_dataset_slug(name: str) -> str:
     """Generates a clean, valid Kaggle dataset slug (lowercase alphanumeric with hyphens)."""
     slug = "".join(c if c.isalnum() else "-" for c in name.lower()).strip("-")

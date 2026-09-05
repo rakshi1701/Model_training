@@ -50,6 +50,7 @@ A comprehensive Streamlit workspace for managing the entire lifecycle of YOLO co
 - **Crash-Safe Artifacts**: A failed run still packages whatever was checkpointed, so partial weights survive an OOM or a mid-run error.
 - **Post-Training Pipeline**: Optionally auto-export the ingested `best.pt` to ONNX / TorchScript / OpenVINO as soon as a cloud run lands.
 - **Standalone Jupyter Template**: Includes a pre-configured `kaggle_yolo_train_template.ipynb` for direct web notebook training.
+- **Disconnect / switch account**: **🚪 Disconnect account** (in the credentials panel) deletes the stored token from this machine — `~/.kaggle/kaggle.json`, `~/.config/kaggle/kaggle.json` and both `access_token` files — and clears the API env vars for the session. It names every file it will remove and asks first. This signs *this machine* out; the token itself stays valid until you revoke it at [kaggle.com/settings](https://www.kaggle.com/settings). To switch accounts, disconnect and then save the new username/key.
 
 > **Note on the quota tracker:** Kaggle publishes no quota API. The figure is estimated from jobs dispatched by this dashboard — runs you start on kaggle.com are not counted. Confirm at [kaggle.com/settings](https://www.kaggle.com/settings).
 

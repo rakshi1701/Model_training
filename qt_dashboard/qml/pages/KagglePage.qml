@@ -125,6 +125,57 @@ Item {
                             wrapMode: Text.WordWrap
                             Layout.fillWidth: true
                         }
+
+                        // Signing out deletes the token files on this machine.
+                        ColumnLayout {
+                            id: signOut
+                            Layout.fillWidth: true
+                            visible: Kaggle && Kaggle.auth.connected
+                            spacing: 6
+                            property bool confirming: false
+
+                            StudioButton {
+                                text: "🚪 Disconnect account"
+                                visible: !signOut.confirming
+                                Layout.fillWidth: true
+                                onClicked: signOut.confirming = true
+                            }
+                            InfoNote {
+                                visible: signOut.confirming
+                                kind: "warn"
+                                text_: "Remove the stored credentials for @"
+                                       + (Kaggle ? Kaggle.auth.user : "") + "?\n"
+                                       + (Kaggle && Kaggle.credentialPaths.length
+                                          ? "Deletes: " + Kaggle.credentialPaths.join("\n         ")
+                                          : "No credential files found — this clears the session only.")
+                                       + "\n\nThe token keeps working elsewhere until you revoke it "
+                                       + "at kaggle.com/settings."
+                            }
+                            RowLayout {
+                                visible: signOut.confirming
+                                Layout.fillWidth: true
+                                spacing: 6
+                                StudioButton {
+                                    text: "🚪 Disconnect"
+                                    kind: "danger"
+                                    Layout.fillWidth: true
+                                    onClicked: {
+                                        signOut.confirming = false
+                                        Kaggle.disconnectAccount()
+                                    }
+                                }
+                                StudioButton {
+                                    text: "🔑 Revoke on kaggle.com"
+                                    Layout.fillWidth: true
+                                    onClicked: App.openUrl("https://www.kaggle.com/settings")
+                                }
+                                StudioButton {
+                                    text: "Cancel"
+                                    Layout.fillWidth: true
+                                    onClicked: signOut.confirming = false
+                                }
+                            }
+                        }
                     }
 
                     Card {
